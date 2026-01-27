@@ -295,41 +295,46 @@ def fetch_btc_prices(start_time_ms: int, end_time_ms: int) -> pd.DataFrame:
     return df
 
 
-def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Optional[float]:
+def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Tuple[Optional[float], Optional[int]]:
     """
     Get BTC price at a specific timestamp.
-    Returns the price at or BEFORE the requested timestamp (not after).
+    Returns (price, used_timestamp_ns) tuple where:
+      - price: the price at or BEFORE the requested timestamp (not after)
+      - used_timestamp_ns: the timestamp of the BTC candle actually selected
     Uses interpolation between the two nearest earlier data points if needed.
     """
     if btc_prices.empty:
-        return None
+        return None, None
 
     timestamp_ms = timestamp_ns // 1_000_000
-    
+
     # Find the index where timestamp_ms would be inserted
     idx = np.searchsorted(btc_prices["timestamp_ms"].values, timestamp_ms, side="right") - 1
 
     if idx < 0:
-        return float(btc_prices.iloc[0]["btc_price"])
-    
+        used_ts_ms = int(btc_prices.iloc[0]["timestamp_ms"])
+        return float(btc_prices.iloc[0]["btc_price"]), used_ts_ms * 1_000_000
+
     if idx < len(btc_prices):
         actual_ts = btc_prices.iloc[idx]["timestamp_ms"]
         if abs(actual_ts - timestamp_ms) < 60000:  # Within 1 minute
-            return float(btc_prices.iloc[idx]["btc_price"])
-    
+            return float(btc_prices.iloc[idx]["btc_price"]), int(actual_ts) * 1_000_000
+
     if idx >= len(btc_prices) - 1:
-        return float(btc_prices.iloc[-1]["btc_price"])
-    
+        used_ts_ms = int(btc_prices.iloc[-1]["timestamp_ms"])
+        return float(btc_prices.iloc[-1]["btc_price"]), used_ts_ms * 1_000_000
+
     t1 = btc_prices.iloc[idx]["timestamp_ms"]
     p1 = btc_prices.iloc[idx]["btc_price"]
     t2 = btc_prices.iloc[idx + 1]["timestamp_ms"]
     p2 = btc_prices.iloc[idx + 1]["btc_price"]
 
     if t2 == t1:
-        return float(p1)
+        return float(p1), int(t1) * 1_000_000
 
     ratio = (timestamp_ms - t1) / (t2 - t1)
-    return float(p1 + ratio * (p2 - p1))
+    # For interpolated values, return the earlier timestamp (t1) as the used timestamp
+    return float(p1 + ratio * (p2 - p1)), int(t1) * 1_000_000
 
 
 # =============================================================================
@@ -521,9 +526,16 @@ def run_single_backtest(
         # Market start time (15 mins before settlement for momentum calc)
         market_start_time_ns = settlement_time_ns - (15 * 60 * 1_000_000_000)
 
-        # Get BTC prices
-        btc_start_price = get_btc_price_at_time(btc_prices, market_start_time_ns)
-        btc_entry_price = get_btc_price_at_time(btc_prices, entry_time_ns)
+        # Get BTC prices (returns price and actual timestamp used)
+        btc_start_price, btc_start_ts = get_btc_price_at_time(btc_prices, market_start_time_ns)
+        btc_entry_price, btc_entry_ts = get_btc_price_at_time(btc_prices, entry_time_ns)
+
+        # Track max timestamp used for feature computation (audit trail)
+        max_ts_used_for_features_ns = 0
+        if btc_start_ts is not None:
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, btc_start_ts)
+        if btc_entry_ts is not None:
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, btc_entry_ts)
 
         # Find last price on each side at entry time
         idx_u = np.searchsorted(tU, entry_time_ns, side='right') - 1 if len(tU) > 0 else -1
@@ -531,6 +543,16 @@ def run_single_backtest(
 
         price_u_at_entry = pU[idx_u] if 0 <= idx_u < len(pU) else None
         price_d_at_entry = pD[idx_d] if 0 <= idx_d < len(pD) else None
+
+        # Track trade timestamps used for features
+        if idx_u >= 0 and idx_u < len(tU):
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, tU[idx_u])
+        if idx_d >= 0 and idx_d < len(tD):
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, tD[idx_d])
+
+        # Audit: ensure no future data leakage in feature computation
+        assert max_ts_used_for_features_ns <= entry_time_ns, \
+            f"Future data leak: max_ts_used={max_ts_used_for_features_ns} > entry_time={entry_time_ns}"
 
         # Determine leader
         if price_u_at_entry is None and price_d_at_entry is None:
