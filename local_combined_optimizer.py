@@ -421,13 +421,14 @@ def calculate_taker_fee(price: float) -> float:
 
 
 # =============================================================================
-# WALK-FORWARD CROSS-VALIDATION
+# WALK-FORWARD TIME-SPLIT OOS EVALUATION
 # =============================================================================
 
 def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
     """
-    Split data chronologically into n_folds for walk-forward optimization.
-    Returns list of (train_df, test_df) tuples.
+    Split data chronologically into n_folds for walk-forward time-split OOS evaluation.
+    Returns list of (unused_df, oos_df) tuples. Note: unused_df is kept for interface
+    compatibility but is not used for training - we only evaluate on oos_df.
     """
     trades_df = trades_df.copy()
     trades_df["date"] = pd.to_datetime(trades_df["timestamp_ns"], unit="ns", utc=True).dt.date
@@ -453,7 +454,7 @@ def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> Lis
         test_df = trades_df[trades_df["date"].isin(test_dates)].copy()
 
         splits.append((train_df, test_df))
-        print(f"  Fold {i+1}: Train dates={len(train_dates)}, Test dates={len(test_dates)}")
+        print(f"  Time-Split OOS Fold {i+1}: OOS dates={len(test_dates)} (excluded={len(train_dates)})")
 
     return splits
 
@@ -820,18 +821,20 @@ def walk_forward_optimize(
     n_folds: int = 5,
 ) -> pd.DataFrame:
     """
-    Run walk-forward optimization over parameter grid.
+    Run walk-forward time-split OOS evaluation over parameter grid.
+    Note: This is pure OOS evaluation - no training occurs. Each fold's data
+    is used only for out-of-sample testing.
     Returns DataFrame with results for each parameter combination.
     """
     print(f"\n{'='*60}")
-    print(f"WALK-FORWARD OPTIMIZATION")
+    print(f"WALK-FORWARD TIME-SPLIT OOS EVALUATION")
     print(f"{'='*60}")
     print(f"Parameter combinations: {len(param_grid)}")
-    print(f"Folds: {n_folds}")
+    print(f"Time-split OOS folds: {n_folds}")
     print(f"Min trades per fold: {MIN_TRADES_PER_FOLD}")
 
-    # Create splits
-    print("\nCreating walk-forward splits...")
+    # Create time-split OOS folds
+    print("\nCreating time-split OOS folds...")
     splits = create_walk_forward_splits(trades_df, n_folds)
 
     # Results storage
@@ -852,12 +855,15 @@ def walk_forward_optimize(
 
     # Helper function for parallel execution
     def test_single_param(params: BacktestParams, splits, btc_prices) -> Dict[str, Any]:
-        """Test a single parameter combination across all folds."""
+        """
+        Test a single parameter combination using walk-forward time-split OOS evaluation.
+        Note: Only evaluates on oos_df; the unused_df is not used for training.
+        """
         fold_results = []
         oos_trades = []
 
-        for fold_idx, (train_df, test_df) in enumerate(splits):
-            result = run_single_backtest(test_df, btc_prices, params)
+        for fold_idx, (_unused_df, oos_df) in enumerate(splits):
+            result = run_single_backtest(oos_df, btc_prices, params)
 
             if result["num_trades"] >= MIN_TRADES_PER_FOLD:
                 metrics = calculate_metrics(result["trades"])
