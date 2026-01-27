@@ -62,6 +62,10 @@ MARKET_SELL_SLIPPAGE = 0.01  # Slippage when exiting (stop loss)
 MIN_TRADES_PER_FOLD = 30
 N_FOLDS = 5
 
+# Outcome labeling: only use trades within this window before settlement
+# to avoid wrong labels when trading stops early
+OUTCOME_WINDOW_SEC = 120  # 2 minutes
+
 
 # =============================================================================
 # DATA LOADING
@@ -504,6 +508,7 @@ def run_single_backtest(
     market_groups = trades_sorted.groupby(["slug", "market_name"], sort=False)
 
     records = []
+    stale_markets = 0  # Count markets skipped due to no trades in outcome window
 
     for (slug, market_name), g in market_groups:
         # Split by side
@@ -602,13 +607,34 @@ def run_single_backtest(
         if leader_side == "up":
             filled_t = tU
             filled_p = pU
-            last_price_bought = pU[-1] if len(pU) > 0 else None
-            last_price_other = pD[-1] if len(pD) > 0 else None
         else:
             filled_t = tD
             filled_p = pD
-            last_price_bought = pD[-1] if len(pD) > 0 else None
-            last_price_other = pU[-1] if len(pU) > 0 else None
+
+        # Outcome labeling: only consider trades within OUTCOME_WINDOW_SEC before settlement
+        # This avoids wrong labels when trading stops early
+        t_ref = settlement_time_ns
+        outcome_window_start_ns = t_ref - int(OUTCOME_WINDOW_SEC * 1_000_000_000)
+
+        # Find last price in outcome window for each side
+        mask_u_in_window = (tU >= outcome_window_start_ns) & (tU <= t_ref)
+        mask_d_in_window = (tD >= outcome_window_start_ns) & (tD <= t_ref)
+
+        last_price_u_window = pU[mask_u_in_window][-1] if np.any(mask_u_in_window) else None
+        last_price_d_window = pD[mask_d_in_window][-1] if np.any(mask_d_in_window) else None
+
+        # If neither side has trades in outcome window, market is stale - skip it
+        if last_price_u_window is None and last_price_d_window is None:
+            stale_markets += 1
+            continue
+
+        # Set last prices based on bought side (using outcome window filtered prices)
+        if leader_side == "up":
+            last_price_bought = last_price_u_window
+            last_price_other = last_price_d_window
+        else:
+            last_price_bought = last_price_d_window
+            last_price_other = last_price_u_window
 
         # Check stop loss
         stop_result = None
@@ -664,6 +690,7 @@ def run_single_backtest(
     return {
         "trades": records,
         "num_trades": len(records),
+        "stale_markets": stale_markets,
     }
 
 
@@ -1055,6 +1082,10 @@ def generate_reports(
     # Run full backtest with best params to get equity curve
     print("\nGenerating equity curve for best parameters...")
     full_result = run_single_backtest(trades_df, btc_prices, best_params)
+
+    # Log stale markets (skipped due to no trades in outcome window)
+    if full_result["stale_markets"] > 0:
+        print(f"  Skipped {full_result['stale_markets']} stale markets (no trades in {OUTCOME_WINDOW_SEC}s outcome window)")
 
     if full_result["num_trades"] > 0:
         trades_list = full_result["trades"]
