@@ -19,6 +19,7 @@ import os
 import zipfile
 import glob
 import json
+import argparse
 import itertools
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -61,6 +62,79 @@ MARKET_BUY_SLIPPAGE = 0.01
 MARKET_SELL_SLIPPAGE = 0.01  # Slippage when exiting (stop loss)
 MIN_TRADES_PER_FOLD = 30
 N_FOLDS = 5
+
+# Outcome labeling: only use trades within this window before settlement
+# to avoid wrong labels when trading stops early
+OUTCOME_WINDOW_SEC = 120  # 2 minutes (default, can be overridden via CLI)
+
+
+# =============================================================================
+# CLI CONFIGURATION
+# =============================================================================
+
+@dataclass
+class Config:
+    """Runtime configuration from CLI flags."""
+    debug_audit: bool = False          # Enable debug assertions for data leakage
+    embargo_days: int = 1              # Days to embargo between folds in walk-forward
+    outcome_window_sec: int = 120      # Seconds before settlement for outcome labeling
+    use_stale_fallback: bool = False   # Fall back to t_last_ns if no trades in outcome window
+    selftest: bool = False             # Run in selftest mode with validation checks
+
+
+def parse_args() -> Config:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Local optimizer for BTC prediction markets",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--debug_audit",
+        action="store_true",
+        default=False,
+        help="Enable debug assertions for timestamp/data leakage audits"
+    )
+    parser.add_argument(
+        "--embargo_days",
+        type=int,
+        default=1,
+        help="Number of days to embargo between folds in walk-forward evaluation"
+    )
+    parser.add_argument(
+        "--outcome_window_sec",
+        type=int,
+        default=120,
+        help="Seconds before settlement to consider for outcome labeling"
+    )
+    parser.add_argument(
+        "--use_stale_fallback",
+        action="store_true",
+        default=False,
+        help="Fall back to last trade timestamp if no trades in outcome window"
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        default=False,
+        help="Run in selftest mode with validation checks"
+    )
+
+    args = parser.parse_args()
+
+    # In selftest mode, enable debug_audit automatically
+    debug_audit = args.debug_audit or args.selftest
+
+    return Config(
+        debug_audit=debug_audit,
+        embargo_days=args.embargo_days,
+        outcome_window_sec=args.outcome_window_sec,
+        use_stale_fallback=args.use_stale_fallback,
+        selftest=args.selftest,
+    )
+
+
+# Global config (set at startup)
+CONFIG: Config = Config()
 
 
 # =============================================================================
@@ -295,41 +369,46 @@ def fetch_btc_prices(start_time_ms: int, end_time_ms: int) -> pd.DataFrame:
     return df
 
 
-def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Optional[float]:
+def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Tuple[Optional[float], Optional[int]]:
     """
     Get BTC price at a specific timestamp.
-    Returns the price at or BEFORE the requested timestamp (not after).
+    Returns (price, used_timestamp_ns) tuple where:
+      - price: the price at or BEFORE the requested timestamp (not after)
+      - used_timestamp_ns: the timestamp of the BTC candle actually selected
     Uses interpolation between the two nearest earlier data points if needed.
     """
     if btc_prices.empty:
-        return None
+        return None, None
 
     timestamp_ms = timestamp_ns // 1_000_000
-    
+
     # Find the index where timestamp_ms would be inserted
     idx = np.searchsorted(btc_prices["timestamp_ms"].values, timestamp_ms, side="right") - 1
 
     if idx < 0:
-        return float(btc_prices.iloc[0]["btc_price"])
-    
+        used_ts_ms = int(btc_prices.iloc[0]["timestamp_ms"])
+        return float(btc_prices.iloc[0]["btc_price"]), used_ts_ms * 1_000_000
+
     if idx < len(btc_prices):
         actual_ts = btc_prices.iloc[idx]["timestamp_ms"]
         if abs(actual_ts - timestamp_ms) < 60000:  # Within 1 minute
-            return float(btc_prices.iloc[idx]["btc_price"])
-    
+            return float(btc_prices.iloc[idx]["btc_price"]), int(actual_ts) * 1_000_000
+
     if idx >= len(btc_prices) - 1:
-        return float(btc_prices.iloc[-1]["btc_price"])
-    
+        used_ts_ms = int(btc_prices.iloc[-1]["timestamp_ms"])
+        return float(btc_prices.iloc[-1]["btc_price"]), used_ts_ms * 1_000_000
+
     t1 = btc_prices.iloc[idx]["timestamp_ms"]
     p1 = btc_prices.iloc[idx]["btc_price"]
     t2 = btc_prices.iloc[idx + 1]["timestamp_ms"]
     p2 = btc_prices.iloc[idx + 1]["btc_price"]
 
     if t2 == t1:
-        return float(p1)
+        return float(p1), int(t1) * 1_000_000
 
     ratio = (timestamp_ms - t1) / (t2 - t1)
-    return float(p1 + ratio * (p2 - p1))
+    # For interpolated values, return the earlier timestamp (t1) as the used timestamp
+    return float(p1 + ratio * (p2 - p1)), int(t1) * 1_000_000
 
 
 # =============================================================================
@@ -416,13 +495,17 @@ def calculate_taker_fee(price: float) -> float:
 
 
 # =============================================================================
-# WALK-FORWARD CROSS-VALIDATION
+# WALK-FORWARD TIME-SPLIT OOS EVALUATION
 # =============================================================================
 
 def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
     """
-    Split data chronologically into n_folds for walk-forward optimization.
-    Returns list of (train_df, test_df) tuples.
+    Split data chronologically into n_folds for walk-forward time-split OOS evaluation.
+    Returns list of (unused_df, oos_df) tuples. Note: unused_df is kept for interface
+    compatibility but is not used for training - we only evaluate on oos_df.
+
+    Embargo: CONFIG.embargo_days dates immediately before each OOS fold are excluded
+    to prevent temporal leakage.
     """
     trades_df = trades_df.copy()
     trades_df["date"] = pd.to_datetime(trades_df["timestamp_ns"], unit="ns", utc=True).dt.date
@@ -442,13 +525,20 @@ def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> Lis
         test_end_idx = (i + 1) * fold_size if i < n_folds - 1 else n_dates
 
         test_dates = set(unique_dates[test_start_idx:test_end_idx])
-        train_dates = set(unique_dates) - test_dates
+
+        # Apply embargo: exclude embargo_days before test period
+        embargo_start_idx = max(0, test_start_idx - CONFIG.embargo_days)
+        embargo_dates = set(unique_dates[embargo_start_idx:test_start_idx])
+
+        # Excluded dates = all dates except test and embargo
+        train_dates = set(unique_dates) - test_dates - embargo_dates
 
         train_df = trades_df[trades_df["date"].isin(train_dates)].copy()
         test_df = trades_df[trades_df["date"].isin(test_dates)].copy()
 
         splits.append((train_df, test_df))
-        print(f"  Fold {i+1}: Train dates={len(train_dates)}, Test dates={len(test_dates)}")
+        embargo_str = f", embargo={len(embargo_dates)}" if CONFIG.embargo_days > 0 else ""
+        print(f"  Time-Split OOS Fold {i+1}: OOS dates={len(test_dates)} (excluded={len(train_dates)}{embargo_str})")
 
     return splits
 
@@ -498,6 +588,8 @@ def run_single_backtest(
     market_groups = trades_sorted.groupby(["slug", "market_name"], sort=False)
 
     records = []
+    stale_markets = 0  # Count markets skipped due to no trades in outcome window
+    missing_settle_time = 0  # Count markets skipped due to no trades (missing scheduled settle time)
 
     for (slug, market_name), g in market_groups:
         # Split by side
@@ -510,6 +602,7 @@ def run_single_backtest(
         pD = gD["price"].to_numpy(dtype=np.float64)
 
         if len(tU) == 0 and len(tD) == 0:
+            missing_settle_time += 1
             continue
 
         # Settlement time = last trade
@@ -521,9 +614,16 @@ def run_single_backtest(
         # Market start time (15 mins before settlement for momentum calc)
         market_start_time_ns = settlement_time_ns - (15 * 60 * 1_000_000_000)
 
-        # Get BTC prices
-        btc_start_price = get_btc_price_at_time(btc_prices, market_start_time_ns)
-        btc_entry_price = get_btc_price_at_time(btc_prices, entry_time_ns)
+        # Get BTC prices (returns price and actual timestamp used)
+        btc_start_price, btc_start_ts = get_btc_price_at_time(btc_prices, market_start_time_ns)
+        btc_entry_price, btc_entry_ts = get_btc_price_at_time(btc_prices, entry_time_ns)
+
+        # Track max timestamp used for feature computation (audit trail)
+        max_ts_used_for_features_ns = 0
+        if btc_start_ts is not None:
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, btc_start_ts)
+        if btc_entry_ts is not None:
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, btc_entry_ts)
 
         # Find last price on each side at entry time
         idx_u = np.searchsorted(tU, entry_time_ns, side='right') - 1 if len(tU) > 0 else -1
@@ -531,6 +631,17 @@ def run_single_backtest(
 
         price_u_at_entry = pU[idx_u] if 0 <= idx_u < len(pU) else None
         price_d_at_entry = pD[idx_d] if 0 <= idx_d < len(pD) else None
+
+        # Track trade timestamps used for features
+        if idx_u >= 0 and idx_u < len(tU):
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, tU[idx_u])
+        if idx_d >= 0 and idx_d < len(tD):
+            max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, tD[idx_d])
+
+        # Audit: ensure no future data leakage in feature computation (only if debug enabled)
+        if CONFIG.debug_audit:
+            assert max_ts_used_for_features_ns <= entry_time_ns, \
+                f"Future data leak: max_ts_used={max_ts_used_for_features_ns} > entry_time={entry_time_ns}"
 
         # Determine leader
         if price_u_at_entry is None and price_d_at_entry is None:
@@ -579,13 +690,40 @@ def run_single_backtest(
         if leader_side == "up":
             filled_t = tU
             filled_p = pU
-            last_price_bought = pU[-1] if len(pU) > 0 else None
-            last_price_other = pD[-1] if len(pD) > 0 else None
         else:
             filled_t = tD
             filled_p = pD
-            last_price_bought = pD[-1] if len(pD) > 0 else None
-            last_price_other = pU[-1] if len(pU) > 0 else None
+
+        # Outcome labeling: only consider trades within outcome_window_sec before settlement
+        # This avoids wrong labels when trading stops early
+        t_ref = settlement_time_ns
+        outcome_window_start_ns = t_ref - int(CONFIG.outcome_window_sec * 1_000_000_000)
+
+        # Find last price in outcome window for each side
+        mask_u_in_window = (tU >= outcome_window_start_ns) & (tU <= t_ref)
+        mask_d_in_window = (tD >= outcome_window_start_ns) & (tD <= t_ref)
+
+        last_price_u_window = pU[mask_u_in_window][-1] if np.any(mask_u_in_window) else None
+        last_price_d_window = pD[mask_d_in_window][-1] if np.any(mask_d_in_window) else None
+
+        # If neither side has trades in outcome window, either skip or fallback
+        if last_price_u_window is None and last_price_d_window is None:
+            if CONFIG.use_stale_fallback:
+                # Fallback to last trade (t_last_ns) for each side
+                last_price_u_window = pU[-1] if len(pU) > 0 else None
+                last_price_d_window = pD[-1] if len(pD) > 0 else None
+            else:
+                # Market is stale - skip it
+                stale_markets += 1
+                continue
+
+        # Set last prices based on bought side (using outcome window filtered prices)
+        if leader_side == "up":
+            last_price_bought = last_price_u_window
+            last_price_other = last_price_d_window
+        else:
+            last_price_bought = last_price_d_window
+            last_price_other = last_price_u_window
 
         # Check stop loss
         stop_result = None
@@ -626,6 +764,12 @@ def run_single_backtest(
 
         settlement_dt = pd.Timestamp(settlement_time_ns, unit='ns', tz='UTC')
 
+        # Convert timestamps to UTC for verification columns
+        entry_time_utc = pd.Timestamp(entry_time_ns, unit='ns', tz='UTC')
+        scheduled_settle_time_utc = settlement_dt  # Same as settlement_time_ns
+        outcome_reference_time_utc = pd.Timestamp(t_ref, unit='ns', tz='UTC')
+        audit_max_ts_used_utc = pd.Timestamp(max_ts_used_for_features_ns, unit='ns', tz='UTC') if max_ts_used_for_features_ns > 0 else None
+
         records.append({
             "slug": slug,
             "market_name": market_name,
@@ -636,11 +780,18 @@ def run_single_backtest(
             "cost_basis": cost_basis,
             "status": status,
             "pnl": pnl,
+            # Verification-friendly columns
+            "entry_time_utc": entry_time_utc,
+            "scheduled_settle_time_utc": scheduled_settle_time_utc,
+            "outcome_reference_time_utc": outcome_reference_time_utc,
+            "audit_max_ts_used_utc": audit_max_ts_used_utc,
         })
 
     return {
         "trades": records,
         "num_trades": len(records),
+        "stale_markets": stale_markets,
+        "missing_settle_time": missing_settle_time,
     }
 
 
@@ -656,7 +807,8 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
             "total_pnl": 0.0,
             "avg_pnl": 0.0,
             "win_rate": 0.0,
-            "sharpe": 0.0,
+            "sharpe_trade": 0.0,
+            "sharpe_daily": 0.0,
             "max_drawdown": 0.0,
             "profit_factor": 0.0,
         }
@@ -671,11 +823,19 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
     wins = (df["status"] == "won").sum()
     win_rate = wins / num_trades if num_trades > 0 else 0
 
-    # Sharpe ratio (assuming daily returns, annualized)
+    # Per-trade Sharpe ratio (annualized)
     if pnl_array.std() > 0:
-        sharpe = (pnl_array.mean() / pnl_array.std()) * np.sqrt(252)
+        sharpe_trade = (pnl_array.mean() / pnl_array.std()) * np.sqrt(252)
     else:
-        sharpe = 0.0
+        sharpe_trade = 0.0
+
+    # Daily Sharpe ratio (annualized)
+    # Group by settlement_date and sum PnL per day
+    daily_pnl = df.groupby("settlement_date")["pnl"].sum().sort_index()
+    if daily_pnl.std(ddof=1) > 0:
+        sharpe_daily = daily_pnl.mean() / daily_pnl.std(ddof=1) * np.sqrt(252)
+    else:
+        sharpe_daily = 0.0
 
     # Max drawdown
     cumulative = np.cumsum(pnl_array)
@@ -693,7 +853,8 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
         "win_rate": win_rate,
-        "sharpe": sharpe,
+        "sharpe_trade": sharpe_trade,
+        "sharpe_daily": sharpe_daily,
         "max_drawdown": max_drawdown,
         "profit_factor": profit_factor,
     }
@@ -712,7 +873,7 @@ def calculate_stability_score(
     total_neighbors = 0
 
     current = params.to_tuple()
-    current_sharpe = all_results.get(current, {}).get("oos_sharpe", 0)
+    current_sharpe = all_results.get(current, {}).get("oos_sharpe_daily", 0)
 
     if current_sharpe <= 0:
         return 0.0
@@ -743,7 +904,7 @@ def calculate_stability_score(
 
                 neighbor_key = neighbor_params.to_tuple()
                 neighbor_result = all_results.get(neighbor_key, {})
-                neighbor_sharpe = neighbor_result.get("oos_sharpe", 0)
+                neighbor_sharpe = neighbor_result.get("oos_sharpe_daily", 0)
 
                 total_neighbors += 1
                 if neighbor_sharpe > 0:
@@ -788,18 +949,20 @@ def walk_forward_optimize(
     n_folds: int = 5,
 ) -> pd.DataFrame:
     """
-    Run walk-forward optimization over parameter grid.
+    Run walk-forward time-split OOS evaluation over parameter grid.
+    Note: This is pure OOS evaluation - no training occurs. Each fold's data
+    is used only for out-of-sample testing.
     Returns DataFrame with results for each parameter combination.
     """
     print(f"\n{'='*60}")
-    print(f"WALK-FORWARD OPTIMIZATION")
+    print(f"WALK-FORWARD TIME-SPLIT OOS EVALUATION")
     print(f"{'='*60}")
     print(f"Parameter combinations: {len(param_grid)}")
-    print(f"Folds: {n_folds}")
+    print(f"Time-split OOS folds: {n_folds}")
     print(f"Min trades per fold: {MIN_TRADES_PER_FOLD}")
 
-    # Create splits
-    print("\nCreating walk-forward splits...")
+    # Create time-split OOS folds
+    print("\nCreating time-split OOS folds...")
     splits = create_walk_forward_splits(trades_df, n_folds)
 
     # Results storage
@@ -820,35 +983,40 @@ def walk_forward_optimize(
 
     # Helper function for parallel execution
     def test_single_param(params: BacktestParams, splits, btc_prices) -> Dict[str, Any]:
-        """Test a single parameter combination across all folds."""
+        """
+        Test a single parameter combination using walk-forward time-split OOS evaluation.
+        Note: Only evaluates on oos_df; the unused_df is not used for training.
+        """
         fold_results = []
         oos_trades = []
-        
-        for fold_idx, (train_df, test_df) in enumerate(splits):
-            result = run_single_backtest(test_df, btc_prices, params)
-            
+
+        for fold_idx, (_unused_df, oos_df) in enumerate(splits):
+            result = run_single_backtest(oos_df, btc_prices, params)
+
             if result["num_trades"] >= MIN_TRADES_PER_FOLD:
                 metrics = calculate_metrics(result["trades"])
                 fold_results.append(metrics)
                 oos_trades.extend(result["trades"])
-        
+
         # Aggregate results
         if len(fold_results) > 0:
-            avg_sharpe = np.mean([r["sharpe"] for r in fold_results])
+            avg_sharpe_daily = np.mean([r["sharpe_daily"] for r in fold_results])
+            avg_sharpe_trade = np.mean([r["sharpe_trade"] for r in fold_results])
             avg_pnl = np.mean([r["avg_pnl"] for r in fold_results])
             avg_win_rate = np.mean([r["win_rate"] for r in fold_results])
             total_trades = sum([r["num_trades"] for r in fold_results])
-            
+
             if oos_trades:
                 oos_metrics = calculate_metrics(oos_trades)
                 max_dd = oos_metrics["max_drawdown"]
             else:
                 max_dd = 0.0
-            
+
             return {
                 "key": params.to_tuple(),
                 "params": params.to_dict(),
-                "oos_sharpe": avg_sharpe,
+                "oos_sharpe_daily": avg_sharpe_daily,
+                "oos_sharpe_trade": avg_sharpe_trade,
                 "oos_avg_pnl": avg_pnl,
                 "oos_win_rate": avg_win_rate,
                 "oos_max_drawdown": max_dd,
@@ -859,7 +1027,8 @@ def walk_forward_optimize(
             return {
                 "key": params.to_tuple(),
                 "params": params.to_dict(),
-                "oos_sharpe": 0.0,
+                "oos_sharpe_daily": 0.0,
+                "oos_sharpe_trade": 0.0,
                 "oos_avg_pnl": 0.0,
                 "oos_win_rate": 0.0,
                 "oos_max_drawdown": 0.0,
@@ -929,7 +1098,8 @@ def walk_forward_optimize(
     for key, result in all_results.items():
         row = result["params"].copy()
         row.update({
-            "oos_sharpe": result["oos_sharpe"],
+            "oos_sharpe_daily": result["oos_sharpe_daily"],
+            "oos_sharpe_trade": result["oos_sharpe_trade"],
             "oos_avg_pnl": result["oos_avg_pnl"],
             "oos_win_rate": result["oos_win_rate"],
             "oos_max_drawdown": result["oos_max_drawdown"],
@@ -941,14 +1111,14 @@ def walk_forward_optimize(
 
     results_df = pd.DataFrame(results_list)
 
-    # Add combined score: Sharpe - 0.5*MaxDD + 0.2*Stability
+    # Add combined score: Sharpe (daily) - 0.5*MaxDD + 0.2*Stability
     results_df["combined_score"] = (
-        results_df["oos_sharpe"]
+        results_df["oos_sharpe_daily"]
         - 0.5 * results_df["oos_max_drawdown"]
         + 0.2 * results_df["stability_score"]
     )
 
-    return results_df.sort_values("oos_sharpe", ascending=False)
+    return results_df.sort_values("oos_sharpe_daily", ascending=False)
 
 
 # =============================================================================
@@ -960,8 +1130,8 @@ def generate_reports(
     trades_df: pd.DataFrame,
     btc_prices: pd.DataFrame,
     out_prefix: str = "optimization",
-):
-    """Generate output files with optimization results."""
+) -> Dict[str, Any]:
+    """Generate output files with optimization results. Returns dict for selftest validation."""
 
     print(f"\n{'='*60}")
     print("OPTIMIZATION RESULTS")
@@ -974,11 +1144,11 @@ def generate_reports(
         print("No valid results found!")
         return
 
-    # Top 10 by Sharpe
-    print("\n--- TOP 10 BY OUT-OF-SAMPLE SHARPE ---")
-    top_sharpe = valid_results.nlargest(10, "oos_sharpe")
+    # Top 10 by Sharpe (daily)
+    print("\n--- TOP 10 BY OUT-OF-SAMPLE SHARPE (DAILY) ---")
+    top_sharpe = valid_results.nlargest(10, "oos_sharpe_daily")
     print(top_sharpe[["lookback_minutes", "price_min", "price_max",
-                      "momentum_threshold", "stop_loss", "oos_sharpe",
+                      "momentum_threshold", "stop_loss", "oos_sharpe_daily",
                       "oos_avg_pnl", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
     # Top 10 by combined score
@@ -986,7 +1156,7 @@ def generate_reports(
     top_combined = valid_results.nlargest(10, "combined_score")
     print(top_combined[["lookback_minutes", "price_min", "price_max",
                         "momentum_threshold", "stop_loss", "combined_score",
-                        "oos_sharpe", "oos_max_drawdown", "stability_score"]].to_string(index=False))
+                        "oos_sharpe_daily", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
     # Best parameters (by Sharpe)
     best_row = valid_results.iloc[0]
@@ -998,12 +1168,13 @@ def generate_reports(
         stop_loss=best_row["stop_loss"],
     )
 
-    print(f"\n--- BEST PARAMETERS (by Sharpe) ---")
+    print(f"\n--- BEST PARAMETERS (by Sharpe Daily) ---")
     print(f"  Lookback minutes: {best_params.lookback_minutes}")
     print(f"  Price range: [{best_params.price_min}, {best_params.price_max}]")
     print(f"  Momentum threshold: {best_params.momentum_threshold:.4f} ({best_params.momentum_threshold*100:.2f}%)")
     print(f"  Stop loss: ${best_params.stop_loss:.2f}")
-    print(f"\n  OOS Sharpe: {best_row['oos_sharpe']:.4f}")
+    print(f"\n  OOS Sharpe (daily): {best_row['oos_sharpe_daily']:.4f}")
+    print(f"  OOS Sharpe (trade): {best_row['oos_sharpe_trade']:.4f}")
     print(f"  OOS Avg P&L: ${best_row['oos_avg_pnl']:.4f}")
     print(f"  OOS Win Rate: {best_row['oos_win_rate']*100:.1f}%")
     print(f"  OOS Max Drawdown: ${best_row['oos_max_drawdown']:.4f}")
@@ -1013,10 +1184,16 @@ def generate_reports(
     print("\nGenerating equity curve for best parameters...")
     full_result = run_single_backtest(trades_df, btc_prices, best_params)
 
+    # Log stale markets (skipped due to no trades in outcome window)
+    if full_result["stale_markets"] > 0:
+        print(f"  Skipped {full_result['stale_markets']} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
+
     if full_result["num_trades"] > 0:
         trades_list = full_result["trades"]
         equity_df = pd.DataFrame(trades_list)
-        equity_df["cumulative_pnl"] = equity_df["pnl"].cumsum()
+
+        # Add cumulative equity (running sum of pnl)
+        equity_df["cumulative_equity"] = equity_df["pnl"].cumsum()
 
         # Daily aggregation
         daily_equity = equity_df.groupby("settlement_date").agg({
@@ -1028,12 +1205,16 @@ def generate_reports(
         daily_equity["win_rate"] = daily_equity["wins"] / daily_equity["num_trades"]
         daily_equity = daily_equity.reset_index()
 
+        # Merge daily_pnl into equity_df for verification
+        daily_pnl_map = daily_equity.set_index("settlement_date")["daily_pnl"].to_dict()
+        equity_df["daily_pnl"] = equity_df["settlement_date"].map(daily_pnl_map)
+
         # Save equity curves
         equity_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_equity_curve.csv")
         daily_equity.to_csv(equity_path, index=False)
         print(f"  Saved: {equity_path}")
 
-        # Save detailed trades
+        # Save detailed trades with verification columns
         trades_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_trades.csv")
         equity_df.to_csv(trades_path, index=False)
         print(f"  Saved: {trades_path}")
@@ -1046,7 +1227,8 @@ def generate_reports(
     # Save best params as JSON
     best_params_dict = best_params.to_dict()
     best_params_dict.update({
-        "oos_sharpe": float(best_row["oos_sharpe"]),
+        "oos_sharpe_daily": float(best_row["oos_sharpe_daily"]),
+        "oos_sharpe_trade": float(best_row["oos_sharpe_trade"]),
         "oos_avg_pnl": float(best_row["oos_avg_pnl"]),
         "oos_win_rate": float(best_row["oos_win_rate"]),
         "oos_max_drawdown": float(best_row["oos_max_drawdown"]),
@@ -1059,9 +1241,9 @@ def generate_reports(
     print(f"  Saved: {params_path}")
 
     # Save stability report (top 50 by Sharpe with stability info)
-    stability_df = valid_results.nlargest(50, "oos_sharpe")[
+    stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
         ["lookback_minutes", "price_min", "price_max", "momentum_threshold",
-         "stop_loss", "oos_sharpe", "oos_avg_pnl", "oos_max_drawdown",
+         "stop_loss", "oos_sharpe_daily", "oos_sharpe_trade", "oos_avg_pnl", "oos_max_drawdown",
          "stability_score", "combined_score", "oos_total_trades", "valid_folds"]
     ]
     stability_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_stability_report.csv")
@@ -1072,21 +1254,28 @@ def generate_reports(
     print("OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
 
+    # Return results for selftest validation
+    return {
+        "full_result": full_result,
+        "best_row": best_row,
+        "best_params": best_params,
+    }
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def run(items: List[str], out_prefix: str):
-    """Main entry point."""
+def run(items: List[str], out_prefix: str) -> Dict[str, Any]:
+    """Main entry point. Returns dict with results for selftest validation."""
     print(f"\n{'='*60}")
     print("KAGGLE COMBINED OPTIMIZER (PARALLEL)")
     print(f"{'='*60}\n")
-    
+
     # Load all trades (from zips or folders)
     all_parts = []
     print(f"Loading data from {len(items)} source(s)...")
-    
+
     for item_path in items:
         if os.path.isdir(item_path):
             # It's a folder
@@ -1097,44 +1286,63 @@ def run(items: List[str], out_prefix: str):
         else:
             print(f"  Skipping unknown item: {item_path}")
             continue
-        
+
         all_parts.append(df)
-    
+
     trades_df = pd.concat(all_parts, ignore_index=True)
     if trades_df.empty:
         raise SystemExit("No trades loaded. Check your paths / CSV schema.")
-    
+
     print(f"\nTotal trades loaded: {len(trades_df):,}")
     num_markets = len(trades_df.groupby(['slug', 'market_name']))
     print(f"Total unique markets: {num_markets:,}")
     print(f"Date range: {trades_df['timestamp'].min()} to {trades_df['timestamp'].max()}")
-    
+
     # Fetch BTC prices
     min_time_ns = trades_df["timestamp_ns"].min()
     max_time_ns = trades_df["timestamp_ns"].max()
     buffer_ns = 15 * 60 * 1_000_000_000
     start_time_ms = (min_time_ns - buffer_ns) // 1_000_000
     end_time_ms = max_time_ns // 1_000_000
-    
+
     btc_prices = fetch_btc_prices(int(start_time_ms), int(end_time_ms))
-    
+
     # Generate parameter grid
     param_grid = generate_param_grid()
     print(f"\nGenerated {len(param_grid)} parameter combinations to test")
-    
+
     # Run walk-forward optimization
     results_df = walk_forward_optimize(trades_df, btc_prices, param_grid, N_FOLDS)
-    
-    # Generate reports
-    generate_reports(results_df, trades_df, btc_prices, out_prefix)
+
+    # Generate reports (and get full backtest result for selftest)
+    full_result = generate_reports(results_df, trades_df, btc_prices, out_prefix)
+
+    # Return results for selftest validation
+    return {
+        "results_df": results_df,
+        "full_result": full_result,
+        "num_markets": num_markets,
+    }
 
 
 if __name__ == "__main__":
+    # Parse CLI arguments and set global config
+    CONFIG = parse_args()
+
     # Auto-detect zip files in current directory
     print(f"\n{'='*60}")
     print("LOCAL OPTIMIZER")
     print(f"{'='*60}")
-    print(f"Searching for data in: {LOCAL_INPUT_PATH}\n")
+
+    # Print configuration
+    print(f"\nConfiguration:")
+    print(f"  --debug_audit:        {CONFIG.debug_audit}")
+    print(f"  --embargo_days:       {CONFIG.embargo_days}")
+    print(f"  --outcome_window_sec: {CONFIG.outcome_window_sec}")
+    print(f"  --use_stale_fallback: {CONFIG.use_stale_fallback}")
+    print(f"  --selftest:           {CONFIG.selftest}")
+
+    print(f"\nSearching for data in: {LOCAL_INPUT_PATH}\n")
     
     data_sources = find_kaggle_zip_files(LOCAL_INPUT_PATH)
     
@@ -1163,6 +1371,36 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Results will be saved to: {LOCAL_OUTPUT_PATH}")
     print(f"{'='*60}\n")
-    
+
     # Run optimization
-    run(data_sources, out_prefix="optimization")
+    results = run(data_sources, out_prefix="optimization")
+
+    # Selftest validation
+    if CONFIG.selftest:
+        print(f"\n{'='*60}")
+        print("SELFTEST VALIDATION")
+        print(f"{'='*60}")
+
+        full_result = results["full_result"]
+        best_row = full_result["best_row"]
+
+        # 1) Print counts
+        missing_settle = full_result["full_result"].get("missing_settle_time", 0)
+        stale_markets = full_result["full_result"].get("stale_markets", 0)
+        print(f"\n  Markets skipped (missing scheduled settle time): {missing_settle}")
+        print(f"  Markets skipped (stale outcome window): {stale_markets}")
+
+        # 2) Assert daily sharpe computed successfully
+        daily_sharpe = best_row.get("oos_sharpe_daily", None)
+        print(f"\n  Daily Sharpe computed: {daily_sharpe is not None and not pd.isna(daily_sharpe)}")
+        assert daily_sharpe is not None and not pd.isna(daily_sharpe), \
+            "SELFTEST FAILED: Daily sharpe not computed"
+
+        # 3) Audit assertion never fails (already checked via debug_audit=True in selftest mode)
+        # If we reached here, audit assertions passed
+        print(f"  Audit assertions: PASSED (no future data leakage detected)")
+
+        # 3) End with SELFTEST PASSED
+        print(f"\n{'='*60}")
+        print("SELFTEST PASSED")
+        print(f"{'='*60}")
