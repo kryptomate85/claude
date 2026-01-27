@@ -750,6 +750,12 @@ def run_single_backtest(
 
         settlement_dt = pd.Timestamp(settlement_time_ns, unit='ns', tz='UTC')
 
+        # Convert timestamps to UTC for verification columns
+        entry_time_utc = pd.Timestamp(entry_time_ns, unit='ns', tz='UTC')
+        scheduled_settle_time_utc = settlement_dt  # Same as settlement_time_ns
+        outcome_reference_time_utc = pd.Timestamp(t_ref, unit='ns', tz='UTC')
+        audit_max_ts_used_utc = pd.Timestamp(max_ts_used_for_features_ns, unit='ns', tz='UTC') if max_ts_used_for_features_ns > 0 else None
+
         records.append({
             "slug": slug,
             "market_name": market_name,
@@ -760,6 +766,11 @@ def run_single_backtest(
             "cost_basis": cost_basis,
             "status": status,
             "pnl": pnl,
+            # Verification-friendly columns
+            "entry_time_utc": entry_time_utc,
+            "scheduled_settle_time_utc": scheduled_settle_time_utc,
+            "outcome_reference_time_utc": outcome_reference_time_utc,
+            "audit_max_ts_used_utc": audit_max_ts_used_utc,
         })
 
     return {
@@ -1165,7 +1176,9 @@ def generate_reports(
     if full_result["num_trades"] > 0:
         trades_list = full_result["trades"]
         equity_df = pd.DataFrame(trades_list)
-        equity_df["cumulative_pnl"] = equity_df["pnl"].cumsum()
+
+        # Add cumulative equity (running sum of pnl)
+        equity_df["cumulative_equity"] = equity_df["pnl"].cumsum()
 
         # Daily aggregation
         daily_equity = equity_df.groupby("settlement_date").agg({
@@ -1177,12 +1190,16 @@ def generate_reports(
         daily_equity["win_rate"] = daily_equity["wins"] / daily_equity["num_trades"]
         daily_equity = daily_equity.reset_index()
 
+        # Merge daily_pnl into equity_df for verification
+        daily_pnl_map = daily_equity.set_index("settlement_date")["daily_pnl"].to_dict()
+        equity_df["daily_pnl"] = equity_df["settlement_date"].map(daily_pnl_map)
+
         # Save equity curves
         equity_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_equity_curve.csv")
         daily_equity.to_csv(equity_path, index=False)
         print(f"  Saved: {equity_path}")
 
-        # Save detailed trades
+        # Save detailed trades with verification columns
         trades_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_trades.csv")
         equity_df.to_csv(trades_path, index=False)
         print(f"  Saved: {trades_path}")
