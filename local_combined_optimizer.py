@@ -656,7 +656,8 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
             "total_pnl": 0.0,
             "avg_pnl": 0.0,
             "win_rate": 0.0,
-            "sharpe": 0.0,
+            "sharpe_trade": 0.0,
+            "sharpe_daily": 0.0,
             "max_drawdown": 0.0,
             "profit_factor": 0.0,
         }
@@ -671,11 +672,19 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
     wins = (df["status"] == "won").sum()
     win_rate = wins / num_trades if num_trades > 0 else 0
 
-    # Sharpe ratio (assuming daily returns, annualized)
+    # Per-trade Sharpe ratio (annualized)
     if pnl_array.std() > 0:
-        sharpe = (pnl_array.mean() / pnl_array.std()) * np.sqrt(252)
+        sharpe_trade = (pnl_array.mean() / pnl_array.std()) * np.sqrt(252)
     else:
-        sharpe = 0.0
+        sharpe_trade = 0.0
+
+    # Daily Sharpe ratio (annualized)
+    # Group by settlement_date and sum PnL per day
+    daily_pnl = df.groupby("settlement_date")["pnl"].sum().sort_index()
+    if daily_pnl.std(ddof=1) > 0:
+        sharpe_daily = daily_pnl.mean() / daily_pnl.std(ddof=1) * np.sqrt(252)
+    else:
+        sharpe_daily = 0.0
 
     # Max drawdown
     cumulative = np.cumsum(pnl_array)
@@ -693,7 +702,8 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
         "total_pnl": total_pnl,
         "avg_pnl": avg_pnl,
         "win_rate": win_rate,
-        "sharpe": sharpe,
+        "sharpe_trade": sharpe_trade,
+        "sharpe_daily": sharpe_daily,
         "max_drawdown": max_drawdown,
         "profit_factor": profit_factor,
     }
@@ -712,7 +722,7 @@ def calculate_stability_score(
     total_neighbors = 0
 
     current = params.to_tuple()
-    current_sharpe = all_results.get(current, {}).get("oos_sharpe", 0)
+    current_sharpe = all_results.get(current, {}).get("oos_sharpe_daily", 0)
 
     if current_sharpe <= 0:
         return 0.0
@@ -743,7 +753,7 @@ def calculate_stability_score(
 
                 neighbor_key = neighbor_params.to_tuple()
                 neighbor_result = all_results.get(neighbor_key, {})
-                neighbor_sharpe = neighbor_result.get("oos_sharpe", 0)
+                neighbor_sharpe = neighbor_result.get("oos_sharpe_daily", 0)
 
                 total_neighbors += 1
                 if neighbor_sharpe > 0:
@@ -823,32 +833,34 @@ def walk_forward_optimize(
         """Test a single parameter combination across all folds."""
         fold_results = []
         oos_trades = []
-        
+
         for fold_idx, (train_df, test_df) in enumerate(splits):
             result = run_single_backtest(test_df, btc_prices, params)
-            
+
             if result["num_trades"] >= MIN_TRADES_PER_FOLD:
                 metrics = calculate_metrics(result["trades"])
                 fold_results.append(metrics)
                 oos_trades.extend(result["trades"])
-        
+
         # Aggregate results
         if len(fold_results) > 0:
-            avg_sharpe = np.mean([r["sharpe"] for r in fold_results])
+            avg_sharpe_daily = np.mean([r["sharpe_daily"] for r in fold_results])
+            avg_sharpe_trade = np.mean([r["sharpe_trade"] for r in fold_results])
             avg_pnl = np.mean([r["avg_pnl"] for r in fold_results])
             avg_win_rate = np.mean([r["win_rate"] for r in fold_results])
             total_trades = sum([r["num_trades"] for r in fold_results])
-            
+
             if oos_trades:
                 oos_metrics = calculate_metrics(oos_trades)
                 max_dd = oos_metrics["max_drawdown"]
             else:
                 max_dd = 0.0
-            
+
             return {
                 "key": params.to_tuple(),
                 "params": params.to_dict(),
-                "oos_sharpe": avg_sharpe,
+                "oos_sharpe_daily": avg_sharpe_daily,
+                "oos_sharpe_trade": avg_sharpe_trade,
                 "oos_avg_pnl": avg_pnl,
                 "oos_win_rate": avg_win_rate,
                 "oos_max_drawdown": max_dd,
@@ -859,7 +871,8 @@ def walk_forward_optimize(
             return {
                 "key": params.to_tuple(),
                 "params": params.to_dict(),
-                "oos_sharpe": 0.0,
+                "oos_sharpe_daily": 0.0,
+                "oos_sharpe_trade": 0.0,
                 "oos_avg_pnl": 0.0,
                 "oos_win_rate": 0.0,
                 "oos_max_drawdown": 0.0,
@@ -929,7 +942,8 @@ def walk_forward_optimize(
     for key, result in all_results.items():
         row = result["params"].copy()
         row.update({
-            "oos_sharpe": result["oos_sharpe"],
+            "oos_sharpe_daily": result["oos_sharpe_daily"],
+            "oos_sharpe_trade": result["oos_sharpe_trade"],
             "oos_avg_pnl": result["oos_avg_pnl"],
             "oos_win_rate": result["oos_win_rate"],
             "oos_max_drawdown": result["oos_max_drawdown"],
@@ -941,14 +955,14 @@ def walk_forward_optimize(
 
     results_df = pd.DataFrame(results_list)
 
-    # Add combined score: Sharpe - 0.5*MaxDD + 0.2*Stability
+    # Add combined score: Sharpe (daily) - 0.5*MaxDD + 0.2*Stability
     results_df["combined_score"] = (
-        results_df["oos_sharpe"]
+        results_df["oos_sharpe_daily"]
         - 0.5 * results_df["oos_max_drawdown"]
         + 0.2 * results_df["stability_score"]
     )
 
-    return results_df.sort_values("oos_sharpe", ascending=False)
+    return results_df.sort_values("oos_sharpe_daily", ascending=False)
 
 
 # =============================================================================
@@ -974,11 +988,11 @@ def generate_reports(
         print("No valid results found!")
         return
 
-    # Top 10 by Sharpe
-    print("\n--- TOP 10 BY OUT-OF-SAMPLE SHARPE ---")
-    top_sharpe = valid_results.nlargest(10, "oos_sharpe")
+    # Top 10 by Sharpe (daily)
+    print("\n--- TOP 10 BY OUT-OF-SAMPLE SHARPE (DAILY) ---")
+    top_sharpe = valid_results.nlargest(10, "oos_sharpe_daily")
     print(top_sharpe[["lookback_minutes", "price_min", "price_max",
-                      "momentum_threshold", "stop_loss", "oos_sharpe",
+                      "momentum_threshold", "stop_loss", "oos_sharpe_daily",
                       "oos_avg_pnl", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
     # Top 10 by combined score
@@ -986,7 +1000,7 @@ def generate_reports(
     top_combined = valid_results.nlargest(10, "combined_score")
     print(top_combined[["lookback_minutes", "price_min", "price_max",
                         "momentum_threshold", "stop_loss", "combined_score",
-                        "oos_sharpe", "oos_max_drawdown", "stability_score"]].to_string(index=False))
+                        "oos_sharpe_daily", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
     # Best parameters (by Sharpe)
     best_row = valid_results.iloc[0]
@@ -998,12 +1012,13 @@ def generate_reports(
         stop_loss=best_row["stop_loss"],
     )
 
-    print(f"\n--- BEST PARAMETERS (by Sharpe) ---")
+    print(f"\n--- BEST PARAMETERS (by Sharpe Daily) ---")
     print(f"  Lookback minutes: {best_params.lookback_minutes}")
     print(f"  Price range: [{best_params.price_min}, {best_params.price_max}]")
     print(f"  Momentum threshold: {best_params.momentum_threshold:.4f} ({best_params.momentum_threshold*100:.2f}%)")
     print(f"  Stop loss: ${best_params.stop_loss:.2f}")
-    print(f"\n  OOS Sharpe: {best_row['oos_sharpe']:.4f}")
+    print(f"\n  OOS Sharpe (daily): {best_row['oos_sharpe_daily']:.4f}")
+    print(f"  OOS Sharpe (trade): {best_row['oos_sharpe_trade']:.4f}")
     print(f"  OOS Avg P&L: ${best_row['oos_avg_pnl']:.4f}")
     print(f"  OOS Win Rate: {best_row['oos_win_rate']*100:.1f}%")
     print(f"  OOS Max Drawdown: ${best_row['oos_max_drawdown']:.4f}")
@@ -1046,7 +1061,8 @@ def generate_reports(
     # Save best params as JSON
     best_params_dict = best_params.to_dict()
     best_params_dict.update({
-        "oos_sharpe": float(best_row["oos_sharpe"]),
+        "oos_sharpe_daily": float(best_row["oos_sharpe_daily"]),
+        "oos_sharpe_trade": float(best_row["oos_sharpe_trade"]),
         "oos_avg_pnl": float(best_row["oos_avg_pnl"]),
         "oos_win_rate": float(best_row["oos_win_rate"]),
         "oos_max_drawdown": float(best_row["oos_max_drawdown"]),
@@ -1059,9 +1075,9 @@ def generate_reports(
     print(f"  Saved: {params_path}")
 
     # Save stability report (top 50 by Sharpe with stability info)
-    stability_df = valid_results.nlargest(50, "oos_sharpe")[
+    stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
         ["lookback_minutes", "price_min", "price_max", "momentum_threshold",
-         "stop_loss", "oos_sharpe", "oos_avg_pnl", "oos_max_drawdown",
+         "stop_loss", "oos_sharpe_daily", "oos_sharpe_trade", "oos_avg_pnl", "oos_max_drawdown",
          "stability_score", "combined_score", "oos_total_trades", "valid_folds"]
     ]
     stability_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_stability_report.csv")
