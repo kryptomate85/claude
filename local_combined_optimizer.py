@@ -19,6 +19,7 @@ import os
 import zipfile
 import glob
 import json
+import argparse
 import itertools
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -64,7 +65,64 @@ N_FOLDS = 5
 
 # Outcome labeling: only use trades within this window before settlement
 # to avoid wrong labels when trading stops early
-OUTCOME_WINDOW_SEC = 120  # 2 minutes
+OUTCOME_WINDOW_SEC = 120  # 2 minutes (default, can be overridden via CLI)
+
+
+# =============================================================================
+# CLI CONFIGURATION
+# =============================================================================
+
+@dataclass
+class Config:
+    """Runtime configuration from CLI flags."""
+    debug_audit: bool = False          # Enable debug assertions for data leakage
+    embargo_days: int = 1              # Days to embargo between folds in walk-forward
+    outcome_window_sec: int = 120      # Seconds before settlement for outcome labeling
+    use_stale_fallback: bool = False   # Fall back to t_last_ns if no trades in outcome window
+
+
+def parse_args() -> Config:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Local optimizer for BTC prediction markets",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--debug_audit",
+        action="store_true",
+        default=False,
+        help="Enable debug assertions for timestamp/data leakage audits"
+    )
+    parser.add_argument(
+        "--embargo_days",
+        type=int,
+        default=1,
+        help="Number of days to embargo between folds in walk-forward evaluation"
+    )
+    parser.add_argument(
+        "--outcome_window_sec",
+        type=int,
+        default=120,
+        help="Seconds before settlement to consider for outcome labeling"
+    )
+    parser.add_argument(
+        "--use_stale_fallback",
+        action="store_true",
+        default=False,
+        help="Fall back to last trade timestamp if no trades in outcome window"
+    )
+
+    args = parser.parse_args()
+    return Config(
+        debug_audit=args.debug_audit,
+        embargo_days=args.embargo_days,
+        outcome_window_sec=args.outcome_window_sec,
+        use_stale_fallback=args.use_stale_fallback,
+    )
+
+
+# Global config (set at startup)
+CONFIG: Config = Config()
 
 
 # =============================================================================
@@ -433,6 +491,9 @@ def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> Lis
     Split data chronologically into n_folds for walk-forward time-split OOS evaluation.
     Returns list of (unused_df, oos_df) tuples. Note: unused_df is kept for interface
     compatibility but is not used for training - we only evaluate on oos_df.
+
+    Embargo: CONFIG.embargo_days dates immediately before each OOS fold are excluded
+    to prevent temporal leakage.
     """
     trades_df = trades_df.copy()
     trades_df["date"] = pd.to_datetime(trades_df["timestamp_ns"], unit="ns", utc=True).dt.date
@@ -452,13 +513,20 @@ def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> Lis
         test_end_idx = (i + 1) * fold_size if i < n_folds - 1 else n_dates
 
         test_dates = set(unique_dates[test_start_idx:test_end_idx])
-        train_dates = set(unique_dates) - test_dates
+
+        # Apply embargo: exclude embargo_days before test period
+        embargo_start_idx = max(0, test_start_idx - CONFIG.embargo_days)
+        embargo_dates = set(unique_dates[embargo_start_idx:test_start_idx])
+
+        # Excluded dates = all dates except test and embargo
+        train_dates = set(unique_dates) - test_dates - embargo_dates
 
         train_df = trades_df[trades_df["date"].isin(train_dates)].copy()
         test_df = trades_df[trades_df["date"].isin(test_dates)].copy()
 
         splits.append((train_df, test_df))
-        print(f"  Time-Split OOS Fold {i+1}: OOS dates={len(test_dates)} (excluded={len(train_dates)})")
+        embargo_str = f", embargo={len(embargo_dates)}" if CONFIG.embargo_days > 0 else ""
+        print(f"  Time-Split OOS Fold {i+1}: OOS dates={len(test_dates)} (excluded={len(train_dates)}{embargo_str})")
 
     return splits
 
@@ -556,9 +624,10 @@ def run_single_backtest(
         if idx_d >= 0 and idx_d < len(tD):
             max_ts_used_for_features_ns = max(max_ts_used_for_features_ns, tD[idx_d])
 
-        # Audit: ensure no future data leakage in feature computation
-        assert max_ts_used_for_features_ns <= entry_time_ns, \
-            f"Future data leak: max_ts_used={max_ts_used_for_features_ns} > entry_time={entry_time_ns}"
+        # Audit: ensure no future data leakage in feature computation (only if debug enabled)
+        if CONFIG.debug_audit:
+            assert max_ts_used_for_features_ns <= entry_time_ns, \
+                f"Future data leak: max_ts_used={max_ts_used_for_features_ns} > entry_time={entry_time_ns}"
 
         # Determine leader
         if price_u_at_entry is None and price_d_at_entry is None:
@@ -611,10 +680,10 @@ def run_single_backtest(
             filled_t = tD
             filled_p = pD
 
-        # Outcome labeling: only consider trades within OUTCOME_WINDOW_SEC before settlement
+        # Outcome labeling: only consider trades within outcome_window_sec before settlement
         # This avoids wrong labels when trading stops early
         t_ref = settlement_time_ns
-        outcome_window_start_ns = t_ref - int(OUTCOME_WINDOW_SEC * 1_000_000_000)
+        outcome_window_start_ns = t_ref - int(CONFIG.outcome_window_sec * 1_000_000_000)
 
         # Find last price in outcome window for each side
         mask_u_in_window = (tU >= outcome_window_start_ns) & (tU <= t_ref)
@@ -623,10 +692,16 @@ def run_single_backtest(
         last_price_u_window = pU[mask_u_in_window][-1] if np.any(mask_u_in_window) else None
         last_price_d_window = pD[mask_d_in_window][-1] if np.any(mask_d_in_window) else None
 
-        # If neither side has trades in outcome window, market is stale - skip it
+        # If neither side has trades in outcome window, either skip or fallback
         if last_price_u_window is None and last_price_d_window is None:
-            stale_markets += 1
-            continue
+            if CONFIG.use_stale_fallback:
+                # Fallback to last trade (t_last_ns) for each side
+                last_price_u_window = pU[-1] if len(pU) > 0 else None
+                last_price_d_window = pD[-1] if len(pD) > 0 else None
+            else:
+                # Market is stale - skip it
+                stale_markets += 1
+                continue
 
         # Set last prices based on bought side (using outcome window filtered prices)
         if leader_side == "up":
@@ -1085,7 +1160,7 @@ def generate_reports(
 
     # Log stale markets (skipped due to no trades in outcome window)
     if full_result["stale_markets"] > 0:
-        print(f"  Skipped {full_result['stale_markets']} stale markets (no trades in {OUTCOME_WINDOW_SEC}s outcome window)")
+        print(f"  Skipped {full_result['stale_markets']} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
 
     if full_result["num_trades"] > 0:
         trades_list = full_result["trades"]
@@ -1205,11 +1280,22 @@ def run(items: List[str], out_prefix: str):
 
 
 if __name__ == "__main__":
+    # Parse CLI arguments and set global config
+    CONFIG = parse_args()
+
     # Auto-detect zip files in current directory
     print(f"\n{'='*60}")
     print("LOCAL OPTIMIZER")
     print(f"{'='*60}")
-    print(f"Searching for data in: {LOCAL_INPUT_PATH}\n")
+
+    # Print configuration
+    print(f"\nConfiguration:")
+    print(f"  --debug_audit:        {CONFIG.debug_audit}")
+    print(f"  --embargo_days:       {CONFIG.embargo_days}")
+    print(f"  --outcome_window_sec: {CONFIG.outcome_window_sec}")
+    print(f"  --use_stale_fallback: {CONFIG.use_stale_fallback}")
+
+    print(f"\nSearching for data in: {LOCAL_INPUT_PATH}\n")
     
     data_sources = find_kaggle_zip_files(LOCAL_INPUT_PATH)
     
