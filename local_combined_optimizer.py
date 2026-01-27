@@ -79,6 +79,7 @@ class Config:
     embargo_days: int = 1              # Days to embargo between folds in walk-forward
     outcome_window_sec: int = 120      # Seconds before settlement for outcome labeling
     use_stale_fallback: bool = False   # Fall back to t_last_ns if no trades in outcome window
+    selftest: bool = False             # Run in selftest mode with validation checks
 
 
 def parse_args() -> Config:
@@ -111,13 +112,24 @@ def parse_args() -> Config:
         default=False,
         help="Fall back to last trade timestamp if no trades in outcome window"
     )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        default=False,
+        help="Run in selftest mode with validation checks"
+    )
 
     args = parser.parse_args()
+
+    # In selftest mode, enable debug_audit automatically
+    debug_audit = args.debug_audit or args.selftest
+
     return Config(
-        debug_audit=args.debug_audit,
+        debug_audit=debug_audit,
         embargo_days=args.embargo_days,
         outcome_window_sec=args.outcome_window_sec,
         use_stale_fallback=args.use_stale_fallback,
+        selftest=args.selftest,
     )
 
 
@@ -577,6 +589,7 @@ def run_single_backtest(
 
     records = []
     stale_markets = 0  # Count markets skipped due to no trades in outcome window
+    missing_settle_time = 0  # Count markets skipped due to no trades (missing scheduled settle time)
 
     for (slug, market_name), g in market_groups:
         # Split by side
@@ -589,6 +602,7 @@ def run_single_backtest(
         pD = gD["price"].to_numpy(dtype=np.float64)
 
         if len(tU) == 0 and len(tD) == 0:
+            missing_settle_time += 1
             continue
 
         # Settlement time = last trade
@@ -777,6 +791,7 @@ def run_single_backtest(
         "trades": records,
         "num_trades": len(records),
         "stale_markets": stale_markets,
+        "missing_settle_time": missing_settle_time,
     }
 
 
@@ -1115,8 +1130,8 @@ def generate_reports(
     trades_df: pd.DataFrame,
     btc_prices: pd.DataFrame,
     out_prefix: str = "optimization",
-):
-    """Generate output files with optimization results."""
+) -> Dict[str, Any]:
+    """Generate output files with optimization results. Returns dict for selftest validation."""
 
     print(f"\n{'='*60}")
     print("OPTIMIZATION RESULTS")
@@ -1239,21 +1254,28 @@ def generate_reports(
     print("OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
 
+    # Return results for selftest validation
+    return {
+        "full_result": full_result,
+        "best_row": best_row,
+        "best_params": best_params,
+    }
+
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def run(items: List[str], out_prefix: str):
-    """Main entry point."""
+def run(items: List[str], out_prefix: str) -> Dict[str, Any]:
+    """Main entry point. Returns dict with results for selftest validation."""
     print(f"\n{'='*60}")
     print("KAGGLE COMBINED OPTIMIZER (PARALLEL)")
     print(f"{'='*60}\n")
-    
+
     # Load all trades (from zips or folders)
     all_parts = []
     print(f"Loading data from {len(items)} source(s)...")
-    
+
     for item_path in items:
         if os.path.isdir(item_path):
             # It's a folder
@@ -1264,36 +1286,43 @@ def run(items: List[str], out_prefix: str):
         else:
             print(f"  Skipping unknown item: {item_path}")
             continue
-        
+
         all_parts.append(df)
-    
+
     trades_df = pd.concat(all_parts, ignore_index=True)
     if trades_df.empty:
         raise SystemExit("No trades loaded. Check your paths / CSV schema.")
-    
+
     print(f"\nTotal trades loaded: {len(trades_df):,}")
     num_markets = len(trades_df.groupby(['slug', 'market_name']))
     print(f"Total unique markets: {num_markets:,}")
     print(f"Date range: {trades_df['timestamp'].min()} to {trades_df['timestamp'].max()}")
-    
+
     # Fetch BTC prices
     min_time_ns = trades_df["timestamp_ns"].min()
     max_time_ns = trades_df["timestamp_ns"].max()
     buffer_ns = 15 * 60 * 1_000_000_000
     start_time_ms = (min_time_ns - buffer_ns) // 1_000_000
     end_time_ms = max_time_ns // 1_000_000
-    
+
     btc_prices = fetch_btc_prices(int(start_time_ms), int(end_time_ms))
-    
+
     # Generate parameter grid
     param_grid = generate_param_grid()
     print(f"\nGenerated {len(param_grid)} parameter combinations to test")
-    
+
     # Run walk-forward optimization
     results_df = walk_forward_optimize(trades_df, btc_prices, param_grid, N_FOLDS)
-    
-    # Generate reports
-    generate_reports(results_df, trades_df, btc_prices, out_prefix)
+
+    # Generate reports (and get full backtest result for selftest)
+    full_result = generate_reports(results_df, trades_df, btc_prices, out_prefix)
+
+    # Return results for selftest validation
+    return {
+        "results_df": results_df,
+        "full_result": full_result,
+        "num_markets": num_markets,
+    }
 
 
 if __name__ == "__main__":
@@ -1311,6 +1340,7 @@ if __name__ == "__main__":
     print(f"  --embargo_days:       {CONFIG.embargo_days}")
     print(f"  --outcome_window_sec: {CONFIG.outcome_window_sec}")
     print(f"  --use_stale_fallback: {CONFIG.use_stale_fallback}")
+    print(f"  --selftest:           {CONFIG.selftest}")
 
     print(f"\nSearching for data in: {LOCAL_INPUT_PATH}\n")
     
@@ -1341,6 +1371,36 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Results will be saved to: {LOCAL_OUTPUT_PATH}")
     print(f"{'='*60}\n")
-    
+
     # Run optimization
-    run(data_sources, out_prefix="optimization")
+    results = run(data_sources, out_prefix="optimization")
+
+    # Selftest validation
+    if CONFIG.selftest:
+        print(f"\n{'='*60}")
+        print("SELFTEST VALIDATION")
+        print(f"{'='*60}")
+
+        full_result = results["full_result"]
+        best_row = full_result["best_row"]
+
+        # 1) Print counts
+        missing_settle = full_result["full_result"].get("missing_settle_time", 0)
+        stale_markets = full_result["full_result"].get("stale_markets", 0)
+        print(f"\n  Markets skipped (missing scheduled settle time): {missing_settle}")
+        print(f"  Markets skipped (stale outcome window): {stale_markets}")
+
+        # 2) Assert daily sharpe computed successfully
+        daily_sharpe = best_row.get("oos_sharpe_daily", None)
+        print(f"\n  Daily Sharpe computed: {daily_sharpe is not None and not pd.isna(daily_sharpe)}")
+        assert daily_sharpe is not None and not pd.isna(daily_sharpe), \
+            "SELFTEST FAILED: Daily sharpe not computed"
+
+        # 3) Audit assertion never fails (already checked via debug_audit=True in selftest mode)
+        # If we reached here, audit assertions passed
+        print(f"  Audit assertions: PASSED (no future data leakage detected)")
+
+        # 3) End with SELFTEST PASSED
+        print(f"\n{'='*60}")
+        print("SELFTEST PASSED")
+        print(f"{'='*60}")
