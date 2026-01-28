@@ -415,12 +415,38 @@ def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Tuple[
 # MARKET NAME PARSING
 # =============================================================================
 
+def extract_timestamp_from_slug(slug: str) -> Optional[int]:
+    """
+    Extract settlement timestamp from market slug.
+
+    Slug format: btc-updown-15m-1762143300
+    The trailing number is a Unix timestamp in seconds for the START of the window.
+    For 15-minute markets, settlement is at the END of the window (start + 15 min).
+
+    Returns settlement timestamp in nanoseconds, or None if parsing fails.
+    """
+    import re
+
+    try:
+        # Extract trailing number from slug
+        match = re.search(r'-(\d{10,})$', slug)
+        if match:
+            start_timestamp_sec = int(match.group(1))
+            # Add 15 minutes (900 seconds) to get settlement time (end of window)
+            settlement_timestamp_sec = start_timestamp_sec + 900
+            return settlement_timestamp_sec * 1_000_000_000
+        return None
+    except Exception:
+        return None
+
+
 def extract_market_timestamp(market_name: str) -> Optional[int]:
     """
-    Extract timestamp from market name for 15-minute BTC markets.
+    Extract settlement timestamp from market name for 15-minute BTC markets.
 
-    Market names typically look like:
-    "Will BTC close above $96,000.00 at 11:00 AM ET on January 24?"
+    Supports two formats:
+    1. "Will BTC close above $96,000.00 at 11:00 AM ET on January 24?"
+    2. "Bitcoin Up or Down - November 2, 11:15PM-11:30PM ET" (uses end time)
 
     Returns timestamp in nanoseconds (UTC), or None if parsing fails.
 
@@ -431,14 +457,22 @@ def extract_market_timestamp(market_name: str) -> Optional[int]:
     from zoneinfo import ZoneInfo
 
     try:
-        # Extract time pattern like "11:00 AM" or "11:15 PM"
-        time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', market_name, re.IGNORECASE)
-        if not time_match:
-            return None
-
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2))
-        ampm = time_match.group(3).upper()
+        # Try format 2 first: time range like "11:15PM-11:30PM ET"
+        # Settlement is at the END of the range
+        range_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)\s*ET', market_name, re.IGNORECASE)
+        if range_match:
+            # Use end time (groups 4, 5, 6)
+            hour = int(range_match.group(4))
+            minute = int(range_match.group(5))
+            ampm = range_match.group(6).upper()
+        else:
+            # Try format 1: single time like "at 11:00 AM ET"
+            time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', market_name, re.IGNORECASE)
+            if not time_match:
+                return None
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+            ampm = time_match.group(3).upper()
 
         # Convert to 24-hour format
         if ampm == 'PM' and hour != 12:
@@ -446,7 +480,7 @@ def extract_market_timestamp(market_name: str) -> Optional[int]:
         elif ampm == 'AM' and hour == 12:
             hour = 0
 
-        # Extract date pattern like "January 24" or "Jan 24"
+        # Extract date pattern like "January 24" or "Jan 24" or "November 2"
         date_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', market_name, re.IGNORECASE)
         if not date_match:
             return None
@@ -609,8 +643,13 @@ def run_single_backtest(
             missing_settle_time += 1
             continue
 
-        # Derive scheduled settlement time from market name (proper ET→UTC conversion)
-        scheduled_settle_ns = extract_market_timestamp(market_name)
+        # Derive scheduled settlement time (in order of reliability):
+        # 1. From slug (contains Unix timestamp directly, most reliable)
+        # 2. From market name (parse ET time and convert to UTC)
+        # 3. Fallback: last trade timestamp
+        scheduled_settle_ns = extract_timestamp_from_slug(slug)
+        if scheduled_settle_ns is None:
+            scheduled_settle_ns = extract_market_timestamp(market_name)
         if scheduled_settle_ns is None:
             # Fallback: use last trade timestamp if parsing fails
             scheduled_settle_ns = int(g["timestamp_ns"].max())
