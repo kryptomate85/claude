@@ -609,8 +609,13 @@ def run_single_backtest(
             missing_settle_time += 1
             continue
 
-        # Settlement time = last trade
-        settlement_time_ns = int(g["timestamp_ns"].max())
+        # Derive scheduled settlement time from market name (proper ET→UTC conversion)
+        scheduled_settle_ns = extract_market_timestamp(market_name)
+        if scheduled_settle_ns is None:
+            # Fallback: use last trade timestamp if parsing fails
+            scheduled_settle_ns = int(g["timestamp_ns"].max())
+
+        settlement_time_ns = scheduled_settle_ns
 
         # Entry time = lookback minutes before settlement
         entry_time_ns = settlement_time_ns - (params.lookback_minutes * 60 * 1_000_000_000)
@@ -770,7 +775,7 @@ def run_single_backtest(
 
         # Convert timestamps to UTC for verification columns
         entry_time_utc = pd.Timestamp(entry_time_ns, unit='ns', tz='UTC')
-        scheduled_settle_time_utc = settlement_dt  # Same as settlement_time_ns
+        scheduled_settle_time_utc = settlement_dt  # Derived from market name via extract_market_timestamp()
         outcome_reference_time_utc = pd.Timestamp(t_ref, unit='ns', tz='UTC')
         audit_max_ts_used_utc = pd.Timestamp(max_ts_used_for_features_ns, unit='ns', tz='UTC') if max_ts_used_for_features_ns > 0 else None
 
