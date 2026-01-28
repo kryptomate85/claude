@@ -627,7 +627,8 @@ def run_single_backtest(
 
     records = []
     stale_markets = 0  # Count markets skipped due to no trades in outcome window
-    missing_settle_time = 0  # Count markets skipped due to no trades (missing scheduled settle time)
+    missing_scheduled_settle = 0  # Count markets skipped due to unparseable settlement time
+    bad_schedule_mismatch = 0  # Count markets skipped due to schedule vs actual trade time mismatch
 
     for (slug, market_name), g in market_groups:
         # Split by side
@@ -640,19 +641,27 @@ def run_single_backtest(
         pD = gD["price"].to_numpy(dtype=np.float64)
 
         if len(tU) == 0 and len(tD) == 0:
-            missing_settle_time += 1
             continue
 
         # Derive scheduled settlement time (in order of reliability):
         # 1. From slug (contains Unix timestamp directly, most reliable)
         # 2. From market name (parse ET time and convert to UTC)
-        # 3. Fallback: last trade timestamp
+        # NO FALLBACK: Skip market if both fail (prevents look-ahead bias)
         scheduled_settle_ns = extract_timestamp_from_slug(slug)
         if scheduled_settle_ns is None:
             scheduled_settle_ns = extract_market_timestamp(market_name)
         if scheduled_settle_ns is None:
-            # Fallback: use last trade timestamp if parsing fails
-            scheduled_settle_ns = int(g["timestamp_ns"].max())
+            # Cannot determine scheduled settlement time - skip market
+            missing_scheduled_settle += 1
+            continue
+
+        # Safety validation: check if scheduled time is reasonable vs actual trades
+        # This does NOT affect timing, only skips clearly broken markets
+        t_last_ns = int(g["timestamp_ns"].max())
+        thirty_minutes_ns = 30 * 60 * 1_000_000_000
+        if abs(t_last_ns - scheduled_settle_ns) > thirty_minutes_ns:
+            bad_schedule_mismatch += 1
+            continue
 
         settlement_time_ns = scheduled_settle_ns
 
@@ -839,7 +848,8 @@ def run_single_backtest(
         "trades": records,
         "num_trades": len(records),
         "stale_markets": stale_markets,
-        "missing_settle_time": missing_settle_time,
+        "missing_scheduled_settle": missing_scheduled_settle,
+        "bad_schedule_mismatch": bad_schedule_mismatch,
     }
 
 
@@ -1232,9 +1242,17 @@ def generate_reports(
     print("\nGenerating equity curve for best parameters...")
     full_result = run_single_backtest(trades_df, btc_prices, best_params)
 
-    # Log stale markets (skipped due to no trades in outcome window)
-    if full_result["stale_markets"] > 0:
-        print(f"  Skipped {full_result['stale_markets']} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
+    # Log skipped markets
+    missing_scheduled = full_result.get("missing_scheduled_settle", 0)
+    bad_mismatch = full_result.get("bad_schedule_mismatch", 0)
+    stale_count = full_result.get("stale_markets", 0)
+
+    if missing_scheduled > 0:
+        print(f"  Skipped {missing_scheduled} markets (unparseable scheduled settlement time)")
+    if bad_mismatch > 0:
+        print(f"  Skipped {bad_mismatch} markets (schedule vs trade time mismatch > 30 min)")
+    if stale_count > 0:
+        print(f"  Skipped {stale_count} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
 
     if full_result["num_trades"] > 0:
         trades_list = full_result["trades"]
@@ -1433,9 +1451,11 @@ if __name__ == "__main__":
         best_row = full_result["best_row"]
 
         # 1) Print counts
-        missing_settle = full_result["full_result"].get("missing_settle_time", 0)
+        missing_scheduled = full_result["full_result"].get("missing_scheduled_settle", 0)
+        bad_mismatch = full_result["full_result"].get("bad_schedule_mismatch", 0)
         stale_markets = full_result["full_result"].get("stale_markets", 0)
-        print(f"\n  Markets skipped (missing scheduled settle time): {missing_settle}")
+        print(f"\n  Markets skipped (unparseable scheduled settle): {missing_scheduled}")
+        print(f"  Markets skipped (schedule mismatch > 30 min): {bad_mismatch}")
         print(f"  Markets skipped (stale outcome window): {stale_markets}")
 
         # 2) Assert daily sharpe computed successfully
