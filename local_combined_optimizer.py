@@ -415,49 +415,86 @@ def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Tuple[
 # MARKET NAME PARSING
 # =============================================================================
 
-def extract_market_timestamp(market_name: str) -> Optional[int]:
+def extract_timestamp_from_slug(slug: str) -> Optional[int]:
     """
-    Extract timestamp from market name for 15-minute BTC markets.
-    
-    Market names typically look like:
-    "Will BTC close above $96,000.00 at 11:00 AM ET on January 24?"
-    
-    Returns timestamp in nanoseconds, or None if parsing fails.
+    Extract settlement timestamp from market slug.
+
+    Slug format: btc-updown-15m-1762143300
+    The trailing number is a Unix timestamp in seconds for the START of the window.
+    For 15-minute markets, settlement is at the END of the window (start + 15 min).
+
+    Returns settlement timestamp in nanoseconds, or None if parsing fails.
     """
     import re
-    from datetime import datetime, timezone, timedelta
-    
+
     try:
-        # Extract time pattern like "11:00 AM" or "11:15 PM"
-        time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', market_name, re.IGNORECASE)
-        if not time_match:
-            return None
-        
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2))
-        ampm = time_match.group(3).upper()
-        
+        # Extract trailing number from slug
+        match = re.search(r'-(\d{10,})$', slug)
+        if match:
+            start_timestamp_sec = int(match.group(1))
+            # Add 15 minutes (900 seconds) to get settlement time (end of window)
+            settlement_timestamp_sec = start_timestamp_sec + 900
+            return settlement_timestamp_sec * 1_000_000_000
+        return None
+    except Exception:
+        return None
+
+
+def extract_market_timestamp(market_name: str) -> Optional[int]:
+    """
+    Extract settlement timestamp from market name for 15-minute BTC markets.
+
+    Supports two formats:
+    1. "Will BTC close above $96,000.00 at 11:00 AM ET on January 24?"
+    2. "Bitcoin Up or Down - November 2, 11:15PM-11:30PM ET" (uses end time)
+
+    Returns timestamp in nanoseconds (UTC), or None if parsing fails.
+
+    Note: Uses zoneinfo for proper ET→UTC conversion with DST handling.
+    """
+    import re
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        # Try format 2 first: time range like "11:15PM-11:30PM ET"
+        # Settlement is at the END of the range
+        range_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)\s*ET', market_name, re.IGNORECASE)
+        if range_match:
+            # Use end time (groups 4, 5, 6)
+            hour = int(range_match.group(4))
+            minute = int(range_match.group(5))
+            ampm = range_match.group(6).upper()
+        else:
+            # Try format 1: single time like "at 11:00 AM ET"
+            time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', market_name, re.IGNORECASE)
+            if not time_match:
+                return None
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2))
+            ampm = time_match.group(3).upper()
+
         # Convert to 24-hour format
         if ampm == 'PM' and hour != 12:
             hour += 12
         elif ampm == 'AM' and hour == 12:
             hour = 0
-        
-        # Extract date pattern like "January 24" or "Jan 24"
+
+        # Extract date pattern like "January 24" or "Jan 24" or "November 2"
         date_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', market_name, re.IGNORECASE)
         if not date_match:
             return None
-        
+
         month_str = date_match.group(1)
         day = int(date_match.group(2))
-        
+
         # Extract year (optional)
         year_match = re.search(r'\b(20\d{2})\b', market_name)
         if year_match:
             year = int(year_match.group(1))
         else:
             year = 2024
-        
+
         # Parse month name
         month_map = {
             'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
@@ -468,15 +505,16 @@ def extract_market_timestamp(market_name: str) -> Optional[int]:
         month = month_map.get(month_str.lower())
         if month is None:
             return None
-        
-        # Create datetime object (ET timezone conversion)
-        dt = datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc)
-        dt_utc = dt + timedelta(hours=5)  # ET to UTC
-        
-        # Convert to nanoseconds
-        timestamp_ns = int(dt_utc.timestamp() * 1_000_000_000)
+
+        # Create datetime in ET timezone, then convert to UTC
+        # ZoneInfo handles DST automatically (EDT=-4, EST=-5)
+        et_tz = ZoneInfo("America/New_York")
+        dt_et = datetime(year, month, day, hour, minute, 0, tzinfo=et_tz)
+
+        # Convert to nanoseconds (timestamp() returns UTC seconds)
+        timestamp_ns = int(dt_et.timestamp() * 1_000_000_000)
         return timestamp_ns
-        
+
     except Exception:
         return None
 
@@ -605,8 +643,18 @@ def run_single_backtest(
             missing_settle_time += 1
             continue
 
-        # Settlement time = last trade
-        settlement_time_ns = int(g["timestamp_ns"].max())
+        # Derive scheduled settlement time (in order of reliability):
+        # 1. From slug (contains Unix timestamp directly, most reliable)
+        # 2. From market name (parse ET time and convert to UTC)
+        # 3. Fallback: last trade timestamp
+        scheduled_settle_ns = extract_timestamp_from_slug(slug)
+        if scheduled_settle_ns is None:
+            scheduled_settle_ns = extract_market_timestamp(market_name)
+        if scheduled_settle_ns is None:
+            # Fallback: use last trade timestamp if parsing fails
+            scheduled_settle_ns = int(g["timestamp_ns"].max())
+
+        settlement_time_ns = scheduled_settle_ns
 
         # Entry time = lookback minutes before settlement
         entry_time_ns = settlement_time_ns - (params.lookback_minutes * 60 * 1_000_000_000)
@@ -766,7 +814,7 @@ def run_single_backtest(
 
         # Convert timestamps to UTC for verification columns
         entry_time_utc = pd.Timestamp(entry_time_ns, unit='ns', tz='UTC')
-        scheduled_settle_time_utc = settlement_dt  # Same as settlement_time_ns
+        scheduled_settle_time_utc = settlement_dt  # Derived from market name via extract_market_timestamp()
         outcome_reference_time_utc = pd.Timestamp(t_ref, unit='ns', tz='UTC')
         audit_max_ts_used_utc = pd.Timestamp(max_ts_used_for_features_ns, unit='ns', tz='UTC') if max_ts_used_for_features_ns > 0 else None
 
