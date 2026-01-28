@@ -418,46 +418,49 @@ def get_btc_price_at_time(btc_prices: pd.DataFrame, timestamp_ns: int) -> Tuple[
 def extract_market_timestamp(market_name: str) -> Optional[int]:
     """
     Extract timestamp from market name for 15-minute BTC markets.
-    
+
     Market names typically look like:
     "Will BTC close above $96,000.00 at 11:00 AM ET on January 24?"
-    
-    Returns timestamp in nanoseconds, or None if parsing fails.
+
+    Returns timestamp in nanoseconds (UTC), or None if parsing fails.
+
+    Note: Uses zoneinfo for proper ET→UTC conversion with DST handling.
     """
     import re
-    from datetime import datetime, timezone, timedelta
-    
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     try:
         # Extract time pattern like "11:00 AM" or "11:15 PM"
         time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', market_name, re.IGNORECASE)
         if not time_match:
             return None
-        
+
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
         ampm = time_match.group(3).upper()
-        
+
         # Convert to 24-hour format
         if ampm == 'PM' and hour != 12:
             hour += 12
         elif ampm == 'AM' and hour == 12:
             hour = 0
-        
+
         # Extract date pattern like "January 24" or "Jan 24"
         date_match = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', market_name, re.IGNORECASE)
         if not date_match:
             return None
-        
+
         month_str = date_match.group(1)
         day = int(date_match.group(2))
-        
+
         # Extract year (optional)
         year_match = re.search(r'\b(20\d{2})\b', market_name)
         if year_match:
             year = int(year_match.group(1))
         else:
             year = 2024
-        
+
         # Parse month name
         month_map = {
             'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
@@ -468,15 +471,16 @@ def extract_market_timestamp(market_name: str) -> Optional[int]:
         month = month_map.get(month_str.lower())
         if month is None:
             return None
-        
-        # Create datetime object (ET timezone conversion)
-        dt = datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc)
-        dt_utc = dt + timedelta(hours=5)  # ET to UTC
-        
-        # Convert to nanoseconds
-        timestamp_ns = int(dt_utc.timestamp() * 1_000_000_000)
+
+        # Create datetime in ET timezone, then convert to UTC
+        # ZoneInfo handles DST automatically (EDT=-4, EST=-5)
+        et_tz = ZoneInfo("America/New_York")
+        dt_et = datetime(year, month, day, hour, minute, 0, tzinfo=et_tz)
+
+        # Convert to nanoseconds (timestamp() returns UTC seconds)
+        timestamp_ns = int(dt_et.timestamp() * 1_000_000_000)
         return timestamp_ns
-        
+
     except Exception:
         return None
 
