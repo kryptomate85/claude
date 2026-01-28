@@ -419,23 +419,28 @@ def extract_timestamp_from_slug(slug: str) -> Optional[int]:
     """
     Extract settlement timestamp from market slug.
 
-    Slug format: btc-updown-15m-1762143300
-    The trailing number is a Unix timestamp in seconds for the START of the window.
+    Slug format: btc-updown-15m-1762143300 (seconds) or btc-updown-15m-1762143300000 (milliseconds)
+    The trailing number is a Unix timestamp for the START of the window.
     For 15-minute markets, settlement is at the END of the window (start + 15 min).
+
+    Handles both seconds and milliseconds timestamps automatically.
 
     Returns settlement timestamp in nanoseconds, or None if parsing fails.
     """
     import re
 
     try:
-        # Extract trailing number from slug
-        match = re.search(r'-(\d{10,})$', slug)
-        if match:
-            start_timestamp_sec = int(match.group(1))
-            # Add 15 minutes (900 seconds) to get settlement time (end of window)
-            settlement_timestamp_sec = start_timestamp_sec + 900
-            return settlement_timestamp_sec * 1_000_000_000
-        return None
+        # Extract trailing number from slug (10-13 digits)
+        m = re.search(r'-(\d{10,13})$', str(slug))
+        if not m:
+            return None
+        ts = int(m.group(1))
+        # If ts is too large for seconds (anything above ~year 2286), treat as milliseconds
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+        # Add 15 minutes (900 seconds) to get settlement time (end of window)
+        settle_sec = ts + 15 * 60
+        return settle_sec * 1_000_000_000
     except Exception:
         return None
 
@@ -539,11 +544,14 @@ def calculate_taker_fee(price: float) -> float:
 def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
     """
     Split data chronologically into n_folds for walk-forward time-split OOS evaluation.
-    Returns list of (unused_df, oos_df) tuples. Note: unused_df is kept for interface
-    compatibility but is not used for training - we only evaluate on oos_df.
+    Returns list of (train_df, oos_df) tuples.
 
-    Embargo: CONFIG.embargo_days dates immediately before each OOS fold are excluded
-    to prevent temporal leakage.
+    STRICTLY CHRONOLOGICAL: Train dates are always BEFORE test dates.
+    - Train: dates[0 : embargo_start_idx]
+    - Embargo: dates[embargo_start_idx : test_start_idx] (excluded)
+    - Test/OOS: dates[test_start_idx : test_end_idx]
+
+    This ensures no future data leakage - train never includes dates after test start.
     """
     trades_df = trades_df.copy()
     trades_df["date"] = pd.to_datetime(trades_df["timestamp_ns"], unit="ns", utc=True).dt.date
@@ -562,21 +570,24 @@ def create_walk_forward_splits(trades_df: pd.DataFrame, n_folds: int = 5) -> Lis
         test_start_idx = i * fold_size
         test_end_idx = (i + 1) * fold_size if i < n_folds - 1 else n_dates
 
+        # Embargo: exclude embargo_days immediately before test period
+        embargo_start_idx = max(0, test_start_idx - CONFIG.embargo_days)
+
+        # STRICTLY CHRONOLOGICAL: train dates are BEFORE embargo/test
+        # Train ends at embargo_start_idx (exclusive)
+        train_end_idx = embargo_start_idx
+
+        # Extract date sets
+        train_dates = set(unique_dates[:train_end_idx])
         test_dates = set(unique_dates[test_start_idx:test_end_idx])
 
-        # Apply embargo: exclude embargo_days before test period
-        embargo_start_idx = max(0, test_start_idx - CONFIG.embargo_days)
-        embargo_dates = set(unique_dates[embargo_start_idx:test_start_idx])
-
-        # Excluded dates = all dates except test and embargo
-        train_dates = set(unique_dates) - test_dates - embargo_dates
-
-        train_df = trades_df[trades_df["date"].isin(train_dates)].copy()
+        # Create DataFrames
+        train_df = trades_df[trades_df["date"].isin(train_dates)].copy() if train_dates else pd.DataFrame(columns=trades_df.columns)
         test_df = trades_df[trades_df["date"].isin(test_dates)].copy()
 
         splits.append((train_df, test_df))
-        embargo_str = f", embargo={len(embargo_dates)}" if CONFIG.embargo_days > 0 else ""
-        print(f"  Time-Split OOS Fold {i+1}: OOS dates={len(test_dates)} (excluded={len(train_dates)}{embargo_str})")
+        embargo_count = test_start_idx - embargo_start_idx
+        print(f"  Time-Split OOS Fold {i+1}: train={len(train_dates)} | oos={len(test_dates)} | embargo_days={embargo_count}")
 
     return splits
 
