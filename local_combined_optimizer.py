@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import requests
 from time import sleep
+from scipy import stats
 
 
 # =============================================================================
@@ -929,6 +930,60 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
     }
 
 
+def calculate_equity_r_squared(trades: List[Dict]) -> float:
+    """
+    Calculate R-squared of cumulative PnL curve using linear regression.
+    Measures how straight and consistent the profit growth is.
+    Returns value between 0 and 1 (1 = perfectly linear equity curve).
+    """
+    if len(trades) < 3:
+        return 0.0
+
+    df = pd.DataFrame(trades)
+    pnl_array = df["pnl"].values
+    cumulative_pnl = np.cumsum(pnl_array)
+
+    # X = trade indices (0, 1, 2, ...)
+    x = np.arange(len(cumulative_pnl))
+
+    # Linear regression: cumulative_pnl = slope * x + intercept
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, cumulative_pnl)
+
+    # R-squared is the square of the correlation coefficient
+    r_squared = r_value ** 2
+
+    return r_squared
+
+
+def calculate_sqn(trades: List[Dict]) -> float:
+    """
+    Calculate System Quality Number (SQN).
+    Formula: (mean_pnl / std_pnl) * sqrt(total_trades)
+
+    SQN interpretation:
+    - < 1.6: Poor
+    - 1.6 - 2.5: Average
+    - 2.5 - 3.0: Good
+    - 3.0 - 5.0: Excellent
+    - 5.0 - 7.0: Superb
+    - > 7.0: Holy Grail
+    """
+    if len(trades) < 2:
+        return 0.0
+
+    df = pd.DataFrame(trades)
+    pnl_array = df["pnl"].values
+
+    mean_pnl = pnl_array.mean()
+    std_pnl = pnl_array.std(ddof=1)
+
+    if std_pnl <= 0:
+        return 0.0
+
+    sqn = (mean_pnl / std_pnl) * np.sqrt(len(pnl_array))
+    return sqn
+
+
 def calculate_stability_score(
     params: BacktestParams,
     all_results: Dict[Tuple, Dict],
@@ -1078,8 +1133,13 @@ def walk_forward_optimize(
             if oos_trades:
                 oos_metrics = calculate_metrics(oos_trades)
                 max_dd = oos_metrics["max_drawdown"]
+                # Calculate R-squared and SQN from combined OOS trades
+                r_squared = calculate_equity_r_squared(oos_trades)
+                sqn = calculate_sqn(oos_trades)
             else:
                 max_dd = 0.0
+                r_squared = 0.0
+                sqn = 0.0
 
             return {
                 "key": params.to_tuple(),
@@ -1091,6 +1151,8 @@ def walk_forward_optimize(
                 "oos_max_drawdown": max_dd,
                 "oos_total_trades": total_trades,
                 "valid_folds": len(fold_results),
+                "r_squared": r_squared,
+                "sqn": sqn,
             }
         else:
             return {
@@ -1103,6 +1165,8 @@ def walk_forward_optimize(
                 "oos_max_drawdown": 0.0,
                 "oos_total_trades": 0,
                 "valid_folds": 0,
+                "r_squared": 0.0,
+                "sqn": 0.0,
             }
     
     print(f"\nRunning optimization...")
@@ -1175,17 +1239,21 @@ def walk_forward_optimize(
             "oos_total_trades": result["oos_total_trades"],
             "valid_folds": result["valid_folds"],
             "stability_score": result.get("stability_score", 0.0),
+            "r_squared": result.get("r_squared", 0.0),
+            "sqn": result.get("sqn", 0.0),
         })
         results_list.append(row)
 
     results_df = pd.DataFrame(results_list)
 
-    # Add combined score: Sharpe (daily) - 0.5*MaxDD + 0.2*Stability
+    # New combined score optimized for Equity Curve Linearity and Drawdown Protection
+    # Formula: (SQN * R2 * stability_score) / max(0.5, oos_max_drawdown)
+    # - Dividing by drawdown penalizes strategies with large losses
+    # - Floor of 0.5 prevents score inflation from lucky low-drawdown periods
+    # - Favors parameters where losses are small and infrequent (safer for compounding)
     results_df["combined_score"] = (
-        results_df["oos_sharpe_daily"]
-        - 0.5 * results_df["oos_max_drawdown"]
-        + 0.2 * results_df["stability_score"]
-    )
+        results_df["sqn"] * results_df["r_squared"] * results_df["stability_score"]
+    ) / results_df["oos_max_drawdown"].clip(lower=0.5)
 
     return results_df.sort_values("oos_sharpe_daily", ascending=False)
 
@@ -1225,7 +1293,7 @@ def generate_reports(
     top_combined = valid_results.nlargest(10, "combined_score")
     print(top_combined[["lookback_minutes", "price_min", "price_max",
                         "momentum_threshold", "stop_loss", "combined_score",
-                        "oos_sharpe_daily", "oos_max_drawdown", "stability_score"]].to_string(index=False))
+                        "sqn", "r_squared", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
     # Best parameters (by Sharpe)
     best_row = valid_results.iloc[0]
@@ -1248,6 +1316,9 @@ def generate_reports(
     print(f"  OOS Win Rate: {best_row['oos_win_rate']*100:.1f}%")
     print(f"  OOS Max Drawdown: ${best_row['oos_max_drawdown']:.4f}")
     print(f"  Stability Score: {best_row['stability_score']:.2f}")
+    print(f"  R-Squared (equity linearity): {best_row['r_squared']:.4f}")
+    print(f"  SQN (System Quality Number): {best_row['sqn']:.4f}")
+    print(f"  Combined Score: {best_row['combined_score']:.4f}")
 
     # Run full backtest with best params to get equity curve
     print("\nGenerating equity curve for best parameters...")
@@ -1310,6 +1381,9 @@ def generate_reports(
         "oos_win_rate": float(best_row["oos_win_rate"]),
         "oos_max_drawdown": float(best_row["oos_max_drawdown"]),
         "stability_score": float(best_row["stability_score"]),
+        "r_squared": float(best_row["r_squared"]),
+        "sqn": float(best_row["sqn"]),
+        "combined_score": float(best_row["combined_score"]),
     })
 
     params_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_params.json")
@@ -1321,7 +1395,7 @@ def generate_reports(
     stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
         ["lookback_minutes", "price_min", "price_max", "momentum_threshold",
          "stop_loss", "oos_sharpe_daily", "oos_sharpe_trade", "oos_avg_pnl", "oos_max_drawdown",
-         "stability_score", "combined_score", "oos_total_trades", "valid_folds"]
+         "stability_score", "r_squared", "sqn", "combined_score", "oos_total_trades", "valid_folds"]
     ]
     stability_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_stability_report.csv")
     stability_df.to_csv(stability_path, index=False)
