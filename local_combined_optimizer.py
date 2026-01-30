@@ -68,6 +68,11 @@ N_FOLDS = 5
 # to avoid wrong labels when trading stops early
 OUTCOME_WINDOW_SEC = 120  # 2 minutes (default, can be overridden via CLI)
 
+# Partial fill and price impact simulation
+TARGET_SIZE_USD = 250.0      # Total dollar amount we want to trade per market
+LIQUIDITY_DECAY = 0.00005    # Price slippage penalty per dollar of size
+LIMIT_PRICE_OFFSET = 0.015   # Maximum slippage we accept (limit order offset)
+
 
 # =============================================================================
 # CLI CONFIGURATION
@@ -749,8 +754,40 @@ def run_single_backtest(
             if not btc_favorable:
                 continue
 
-        # Market buy with slippage
-        entry_price = min(leader_price + MARKET_BUY_SLIPPAGE, 0.99)
+        # Calculate slippage-adjusted entry price with liquidity decay
+        # Adjusted_Entry = leader_price + slippage + (TARGET_SIZE_USD * LIQUIDITY_DECAY)
+        price_impact = TARGET_SIZE_USD * LIQUIDITY_DECAY
+        adjusted_entry = leader_price + MARKET_BUY_SLIPPAGE + price_impact
+        adjusted_entry = min(adjusted_entry, 0.99)  # Cap at 0.99
+
+        # Limit order fill check
+        limit_price = leader_price + LIMIT_PRICE_OFFSET
+
+        if adjusted_entry <= limit_price:
+            # Full fill at adjusted entry price
+            entry_price = adjusted_entry
+            fill_percentage = 1.0
+            filled_size_usd = TARGET_SIZE_USD
+        else:
+            # Partial fill - only fill portion that fits under limit price
+            # Calculate what size would result in limit_price
+            # limit_price = leader_price + MARKET_BUY_SLIPPAGE + (partial_size * LIQUIDITY_DECAY)
+            # partial_size = (limit_price - leader_price - MARKET_BUY_SLIPPAGE) / LIQUIDITY_DECAY
+            available_slippage = limit_price - leader_price - MARKET_BUY_SLIPPAGE
+            if available_slippage > 0 and LIQUIDITY_DECAY > 0:
+                partial_size = available_slippage / LIQUIDITY_DECAY
+                fill_percentage = min(partial_size / TARGET_SIZE_USD, 1.0)
+                filled_size_usd = fill_percentage * TARGET_SIZE_USD
+            else:
+                # No room for any fill
+                fill_percentage = 0.0
+                filled_size_usd = 0.0
+            entry_price = limit_price  # Fill at limit price
+
+        # Skip if no fill
+        if fill_percentage <= 0:
+            continue
+
         taker_fee_rate = calculate_taker_fee(entry_price)
         taker_fee = entry_price * taker_fee_rate
         cost_basis = entry_price + taker_fee
@@ -810,7 +847,7 @@ def run_single_backtest(
             exit_price_with_slippage = max(actual_exit_price - MARKET_SELL_SLIPPAGE, 0.01)
             exit_fee_rate = calculate_taker_fee(exit_price_with_slippage)
             exit_fee = exit_price_with_slippage * exit_fee_rate
-            pnl = (exit_price_with_slippage - exit_fee) - cost_basis
+            raw_pnl = (exit_price_with_slippage - exit_fee) - cost_basis
         else:
             # Held to settlement - determine winner
             if last_price_bought is None:
@@ -826,10 +863,13 @@ def run_single_backtest(
 
             if winner_side == leader_side:
                 status = "won"
-                pnl = 1.0 - cost_basis
+                raw_pnl = 1.0 - cost_basis
             else:
                 status = "lost"
-                pnl = 0.0 - cost_basis
+                raw_pnl = 0.0 - cost_basis
+
+        # Scale PnL by fill percentage (partial fills have proportionally smaller P&L)
+        pnl = raw_pnl * fill_percentage
 
         settlement_dt = pd.Timestamp(settlement_time_ns, unit='ns', tz='UTC')
 
@@ -846,6 +886,9 @@ def run_single_backtest(
             "leader_side": leader_side,
             "leader_price": leader_price,
             "entry_price": entry_price,
+            "adjusted_entry": adjusted_entry,
+            "fill_percentage": fill_percentage,
+            "filled_size_usd": filled_size_usd,
             "cost_basis": cost_basis,
             "status": status,
             "pnl": pnl,
@@ -881,6 +924,7 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
             "sharpe_daily": 0.0,
             "max_drawdown": 0.0,
             "profit_factor": 0.0,
+            "volume_weighted_efficiency": 0.0,
         }
 
     df = pd.DataFrame(trades)
@@ -918,6 +962,15 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
     gross_loss = abs(pnl_array[pnl_array < 0].sum())
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
+    # Volume-weighted efficiency: Total Filled USD / Total Intended USD
+    # Measures how well we can execute at our target size
+    if "filled_size_usd" in df.columns:
+        total_filled_usd = df["filled_size_usd"].sum()
+        total_intended_usd = num_trades * TARGET_SIZE_USD
+        volume_weighted_efficiency = total_filled_usd / total_intended_usd if total_intended_usd > 0 else 0.0
+    else:
+        volume_weighted_efficiency = 1.0  # Default for legacy trades without fill info
+
     return {
         "num_trades": num_trades,
         "total_pnl": total_pnl,
@@ -927,6 +980,7 @@ def calculate_metrics(trades: List[Dict]) -> Dict[str, float]:
         "sharpe_daily": sharpe_daily,
         "max_drawdown": max_drawdown,
         "profit_factor": profit_factor,
+        "volume_weighted_efficiency": volume_weighted_efficiency,
     }
 
 
@@ -1133,11 +1187,13 @@ def walk_forward_optimize(
             if oos_trades:
                 oos_metrics = calculate_metrics(oos_trades)
                 max_dd = oos_metrics["max_drawdown"]
+                vol_efficiency = oos_metrics["volume_weighted_efficiency"]
                 # Calculate R-squared and SQN from combined OOS trades
                 r_squared = calculate_equity_r_squared(oos_trades)
                 sqn = calculate_sqn(oos_trades)
             else:
                 max_dd = 0.0
+                vol_efficiency = 0.0
                 r_squared = 0.0
                 sqn = 0.0
 
@@ -1153,6 +1209,7 @@ def walk_forward_optimize(
                 "valid_folds": len(fold_results),
                 "r_squared": r_squared,
                 "sqn": sqn,
+                "volume_weighted_efficiency": vol_efficiency,
             }
         else:
             return {
@@ -1167,6 +1224,7 @@ def walk_forward_optimize(
                 "valid_folds": 0,
                 "r_squared": 0.0,
                 "sqn": 0.0,
+                "volume_weighted_efficiency": 0.0,
             }
     
     print(f"\nRunning optimization...")
@@ -1241,6 +1299,7 @@ def walk_forward_optimize(
             "stability_score": result.get("stability_score", 0.0),
             "r_squared": result.get("r_squared", 0.0),
             "sqn": result.get("sqn", 0.0),
+            "volume_weighted_efficiency": result.get("volume_weighted_efficiency", 0.0),
         })
         results_list.append(row)
 
@@ -1318,6 +1377,7 @@ def generate_reports(
     print(f"  Stability Score: {best_row['stability_score']:.2f}")
     print(f"  R-Squared (equity linearity): {best_row['r_squared']:.4f}")
     print(f"  SQN (System Quality Number): {best_row['sqn']:.4f}")
+    print(f"  Volume-Weighted Efficiency: {best_row['volume_weighted_efficiency']*100:.1f}%")
     print(f"  Combined Score: {best_row['combined_score']:.4f}")
 
     # Run full backtest with best params to get equity curve
@@ -1383,6 +1443,7 @@ def generate_reports(
         "stability_score": float(best_row["stability_score"]),
         "r_squared": float(best_row["r_squared"]),
         "sqn": float(best_row["sqn"]),
+        "volume_weighted_efficiency": float(best_row["volume_weighted_efficiency"]),
         "combined_score": float(best_row["combined_score"]),
     })
 
@@ -1395,7 +1456,8 @@ def generate_reports(
     stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
         ["lookback_minutes", "price_min", "price_max", "momentum_threshold",
          "stop_loss", "oos_sharpe_daily", "oos_sharpe_trade", "oos_avg_pnl", "oos_max_drawdown",
-         "stability_score", "r_squared", "sqn", "combined_score", "oos_total_trades", "valid_folds"]
+         "stability_score", "r_squared", "sqn", "volume_weighted_efficiency", "combined_score",
+         "oos_total_trades", "valid_folds"]
     ]
     stability_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_stability_report.csv")
     stability_df.to_csv(stability_path, index=False)
