@@ -1038,6 +1038,106 @@ def calculate_sqn(trades: List[Dict]) -> float:
     return sqn
 
 
+def calculate_barbell_weight(entry_time_ns: int, min_time_ns: int, max_time_ns: int) -> float:
+    """
+    Calculate barbell (U-shaped) weight for a trade based on its entry time.
+
+    Prioritizes both earliest and most recent data:
+    - First 20% of data: Weight = 1.0
+    - Middle 60% of data: Weight = 0.5
+    - Last 20% of data: Weight = 1.0
+
+    Args:
+        entry_time_ns: Entry timestamp in nanoseconds
+        min_time_ns: Earliest timestamp in dataset (nanoseconds)
+        max_time_ns: Latest timestamp in dataset (nanoseconds)
+
+    Returns:
+        Weight between 0.5 and 1.0
+    """
+    if max_time_ns <= min_time_ns:
+        return 1.0
+
+    # Calculate position in dataset as fraction [0, 1]
+    position = (entry_time_ns - min_time_ns) / (max_time_ns - min_time_ns)
+    position = max(0.0, min(1.0, position))  # Clamp to [0, 1]
+
+    # U-shaped weighting
+    if position <= 0.20:
+        # First 20%: full weight
+        return 1.0
+    elif position >= 0.80:
+        # Last 20%: full weight
+        return 1.0
+    else:
+        # Middle 60%: reduced weight
+        return 0.5
+
+
+def calculate_weighted_sqn(trades: List[Dict], weights: List[float]) -> float:
+    """
+    Calculate weighted System Quality Number (SQN).
+    Formula: (weighted_mean_pnl / weighted_std_pnl) * sqrt(sum_of_weights)
+
+    Args:
+        trades: List of trade dicts with 'pnl' field
+        weights: List of weights corresponding to each trade
+
+    Returns:
+        Weighted SQN value
+    """
+    if len(trades) < 2 or len(weights) != len(trades):
+        return 0.0
+
+    df = pd.DataFrame(trades)
+    pnl_array = df["pnl"].values
+    weights_array = np.array(weights)
+
+    # Weighted mean
+    sum_weights = weights_array.sum()
+    if sum_weights <= 0:
+        return 0.0
+
+    weighted_mean = np.average(pnl_array, weights=weights_array)
+
+    # Weighted standard deviation
+    # Using reliability weights formula: sqrt(sum(w * (x - mean)^2) / sum(w))
+    weighted_var = np.average((pnl_array - weighted_mean) ** 2, weights=weights_array)
+    weighted_std = np.sqrt(weighted_var)
+
+    if weighted_std <= 0:
+        return 0.0
+
+    # Weighted SQN: use effective sample size based on sum of weights
+    weighted_sqn = (weighted_mean / weighted_std) * np.sqrt(sum_weights)
+    return weighted_sqn
+
+
+def calculate_weighted_avg_pnl(trades: List[Dict], weights: List[float]) -> float:
+    """
+    Calculate weighted average PnL.
+
+    Args:
+        trades: List of trade dicts with 'pnl' field
+        weights: List of weights corresponding to each trade
+
+    Returns:
+        Weighted average PnL
+    """
+    if len(trades) == 0 or len(weights) != len(trades):
+        return 0.0
+
+    df = pd.DataFrame(trades)
+    pnl_array = df["pnl"].values
+    weights_array = np.array(weights)
+
+    sum_weights = weights_array.sum()
+    if sum_weights <= 0:
+        return 0.0
+
+    return np.average(pnl_array, weights=weights_array)
+
+
 def calculate_stability_score(
     params: BacktestParams,
     all_results: Dict[Tuple, Dict],
@@ -1191,11 +1291,29 @@ def walk_forward_optimize(
                 # Calculate R-squared and SQN from combined OOS trades
                 r_squared = calculate_equity_r_squared(oos_trades)
                 sqn = calculate_sqn(oos_trades)
+
+                # Calculate barbell-weighted metrics
+                # Get time bounds from OOS trades (using entry_time_utc)
+                entry_times_ns = [int(t["entry_time_utc"].value) for t in oos_trades]
+                min_time_ns = min(entry_times_ns)
+                max_time_ns = max(entry_times_ns)
+
+                # Compute barbell weights for each trade
+                barbell_weights = [
+                    calculate_barbell_weight(et, min_time_ns, max_time_ns)
+                    for et in entry_times_ns
+                ]
+
+                # Calculate weighted metrics
+                weighted_sqn = calculate_weighted_sqn(oos_trades, barbell_weights)
+                weighted_avg_pnl = calculate_weighted_avg_pnl(oos_trades, barbell_weights)
             else:
                 max_dd = 0.0
                 vol_efficiency = 0.0
                 r_squared = 0.0
                 sqn = 0.0
+                weighted_sqn = 0.0
+                weighted_avg_pnl = 0.0
 
             return {
                 "key": params.to_tuple(),
@@ -1210,6 +1328,8 @@ def walk_forward_optimize(
                 "r_squared": r_squared,
                 "sqn": sqn,
                 "volume_weighted_efficiency": vol_efficiency,
+                "weighted_sqn": weighted_sqn,
+                "weighted_avg_pnl": weighted_avg_pnl,
             }
         else:
             return {
@@ -1225,6 +1345,8 @@ def walk_forward_optimize(
                 "r_squared": 0.0,
                 "sqn": 0.0,
                 "volume_weighted_efficiency": 0.0,
+                "weighted_sqn": 0.0,
+                "weighted_avg_pnl": 0.0,
             }
     
     print(f"\nRunning optimization...")
@@ -1300,6 +1422,8 @@ def walk_forward_optimize(
             "r_squared": result.get("r_squared", 0.0),
             "sqn": result.get("sqn", 0.0),
             "volume_weighted_efficiency": result.get("volume_weighted_efficiency", 0.0),
+            "weighted_sqn": result.get("weighted_sqn", 0.0),
+            "weighted_avg_pnl": result.get("weighted_avg_pnl", 0.0),
         })
         results_list.append(row)
 
@@ -1312,6 +1436,13 @@ def walk_forward_optimize(
     # - Favors parameters where losses are small and infrequent (safer for compounding)
     results_df["combined_score"] = (
         results_df["sqn"] * results_df["r_squared"] * results_df["stability_score"]
+    ) / results_df["oos_max_drawdown"].clip(lower=0.5)
+
+    # Barbell score: uses weighted metrics that prioritize earliest and most recent data
+    # Formula: (weighted_SQN * R2 * stability_score) / max(0.5, oos_max_drawdown)
+    # Same as combined_score but with barbell-weighted SQN
+    results_df["barbell_score"] = (
+        results_df["weighted_sqn"] * results_df["r_squared"] * results_df["stability_score"]
     ) / results_df["oos_max_drawdown"].clip(lower=0.5)
 
     return results_df.sort_values("oos_sharpe_daily", ascending=False)
@@ -1354,6 +1485,13 @@ def generate_reports(
                         "momentum_threshold", "stop_loss", "combined_score",
                         "sqn", "r_squared", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
+    # Top 10 by barbell score
+    print("\n--- TOP 10 BY BARBELL SCORE ---")
+    top_barbell = valid_results.nlargest(10, "barbell_score")
+    print(top_barbell[["lookback_minutes", "price_min", "price_max",
+                       "momentum_threshold", "stop_loss", "barbell_score",
+                       "weighted_sqn", "r_squared", "oos_max_drawdown", "stability_score"]].to_string(index=False))
+
     # Best parameters (by Sharpe)
     best_row = valid_results.iloc[0]
     best_params = BacktestParams(
@@ -1377,8 +1515,11 @@ def generate_reports(
     print(f"  Stability Score: {best_row['stability_score']:.2f}")
     print(f"  R-Squared (equity linearity): {best_row['r_squared']:.4f}")
     print(f"  SQN (System Quality Number): {best_row['sqn']:.4f}")
+    print(f"  Weighted SQN (barbell): {best_row['weighted_sqn']:.4f}")
+    print(f"  Weighted Avg P&L (barbell): ${best_row['weighted_avg_pnl']:.4f}")
     print(f"  Volume-Weighted Efficiency: {best_row['volume_weighted_efficiency']*100:.1f}%")
     print(f"  Combined Score: {best_row['combined_score']:.4f}")
+    print(f"  Barbell Score: {best_row['barbell_score']:.4f}")
 
     # Run full backtest with best params to get equity curve
     print("\nGenerating equity curve for best parameters...")
@@ -1443,8 +1584,11 @@ def generate_reports(
         "stability_score": float(best_row["stability_score"]),
         "r_squared": float(best_row["r_squared"]),
         "sqn": float(best_row["sqn"]),
+        "weighted_sqn": float(best_row["weighted_sqn"]),
+        "weighted_avg_pnl": float(best_row["weighted_avg_pnl"]),
         "volume_weighted_efficiency": float(best_row["volume_weighted_efficiency"]),
         "combined_score": float(best_row["combined_score"]),
+        "barbell_score": float(best_row["barbell_score"]),
     })
 
     params_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_params.json")
@@ -1456,7 +1600,8 @@ def generate_reports(
     stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
         ["lookback_minutes", "price_min", "price_max", "momentum_threshold",
          "stop_loss", "oos_sharpe_daily", "oos_sharpe_trade", "oos_avg_pnl", "oos_max_drawdown",
-         "stability_score", "r_squared", "sqn", "volume_weighted_efficiency", "combined_score",
+         "stability_score", "r_squared", "sqn", "weighted_sqn", "weighted_avg_pnl",
+         "volume_weighted_efficiency", "combined_score", "barbell_score",
          "oos_total_trades", "valid_folds"]
     ]
     stability_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_stability_report.csv")
