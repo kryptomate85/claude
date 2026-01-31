@@ -1492,109 +1492,216 @@ def generate_reports(
                        "momentum_threshold", "stop_loss", "barbell_score",
                        "weighted_sqn", "r_squared", "oos_max_drawdown", "stability_score"]].to_string(index=False))
 
-    # Best parameters (by Sharpe)
-    best_row = valid_results.iloc[0]
-    best_params = BacktestParams(
-        lookback_minutes=int(best_row["lookback_minutes"]),
-        price_min=best_row["price_min"],
-        price_max=best_row["price_max"],
-        momentum_threshold=best_row["momentum_threshold"],
-        stop_loss=best_row["stop_loss"],
+    # ==========================================================================
+    # DUAL WINNER LOGIC: Find Original and Barbell winners
+    # ==========================================================================
+
+    # Original Winner: Sort by oos_sharpe_daily descending
+    original_sorted = valid_results.sort_values("oos_sharpe_daily", ascending=False)
+    original_row = original_sorted.iloc[0]
+    original_params = BacktestParams(
+        lookback_minutes=int(original_row["lookback_minutes"]),
+        price_min=original_row["price_min"],
+        price_max=original_row["price_max"],
+        momentum_threshold=original_row["momentum_threshold"],
+        stop_loss=original_row["stop_loss"],
     )
 
-    print(f"\n--- BEST PARAMETERS (by Sharpe Daily) ---")
-    print(f"  Lookback minutes: {best_params.lookback_minutes}")
-    print(f"  Price range: [{best_params.price_min}, {best_params.price_max}]")
-    print(f"  Momentum threshold: {best_params.momentum_threshold:.4f} ({best_params.momentum_threshold*100:.2f}%)")
-    print(f"  Stop loss: ${best_params.stop_loss:.2f}")
-    print(f"\n  OOS Sharpe (daily): {best_row['oos_sharpe_daily']:.4f}")
-    print(f"  OOS Sharpe (trade): {best_row['oos_sharpe_trade']:.4f}")
-    print(f"  OOS Avg P&L: ${best_row['oos_avg_pnl']:.4f}")
-    print(f"  OOS Win Rate: {best_row['oos_win_rate']*100:.1f}%")
-    print(f"  OOS Max Drawdown: ${best_row['oos_max_drawdown']:.4f}")
-    print(f"  Stability Score: {best_row['stability_score']:.2f}")
-    print(f"  R-Squared (equity linearity): {best_row['r_squared']:.4f}")
-    print(f"  SQN (System Quality Number): {best_row['sqn']:.4f}")
-    print(f"  Weighted SQN (barbell): {best_row['weighted_sqn']:.4f}")
-    print(f"  Weighted Avg P&L (barbell): ${best_row['weighted_avg_pnl']:.4f}")
-    print(f"  Volume-Weighted Efficiency: {best_row['volume_weighted_efficiency']*100:.1f}%")
-    print(f"  Combined Score: {best_row['combined_score']:.4f}")
-    print(f"  Barbell Score: {best_row['barbell_score']:.4f}")
+    # Barbell Winner: Sort by barbell_score descending
+    barbell_sorted = valid_results.sort_values("barbell_score", ascending=False)
+    barbell_row = barbell_sorted.iloc[0]
+    barbell_params = BacktestParams(
+        lookback_minutes=int(barbell_row["lookback_minutes"]),
+        price_min=barbell_row["price_min"],
+        price_max=barbell_row["price_max"],
+        momentum_threshold=barbell_row["momentum_threshold"],
+        stop_loss=barbell_row["stop_loss"],
+    )
 
-    # Run full backtest with best params to get equity curve
-    print("\nGenerating equity curve for best parameters...")
-    full_result = run_single_backtest(trades_df, btc_prices, best_params)
+    # Check if same parameters won both
+    same_winner = original_params.to_tuple() == barbell_params.to_tuple()
 
-    # Log skipped markets
-    missing_scheduled = full_result.get("missing_scheduled_settle", 0)
-    bad_mismatch = full_result.get("bad_schedule_mismatch", 0)
-    stale_count = full_result.get("stale_markets", 0)
+    # ==========================================================================
+    # SIDE-BY-SIDE COMPARISON PRINTOUT
+    # ==========================================================================
 
-    if missing_scheduled > 0:
-        print(f"  Skipped {missing_scheduled} markets (unparseable scheduled settlement time)")
-    if bad_mismatch > 0:
-        print(f"  Skipped {bad_mismatch} markets (schedule vs trade time mismatch > 30 min)")
-    if stale_count > 0:
-        print(f"  Skipped {stale_count} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
+    print(f"\n{'='*60}")
+    print("WINNER COMPARISON: ORIGINAL vs BARBELL")
+    print(f"{'='*60}")
 
-    if full_result["num_trades"] > 0:
-        trades_list = full_result["trades"]
-        equity_df = pd.DataFrame(trades_list)
+    if same_winner:
+        print("\n  *** SAME PARAMETERS WON BOTH CATEGORIES ***\n")
 
-        # Add cumulative equity (running sum of pnl)
-        equity_df["cumulative_equity"] = equity_df["pnl"].cumsum()
+    # Header
+    print(f"{'Metric':<35} {'ORIGINAL':>15} {'BARBELL':>15}")
+    print(f"{'-'*35} {'-'*15} {'-'*15}")
 
-        # Daily aggregation
-        daily_equity = equity_df.groupby("settlement_date").agg({
-            "pnl": ["sum", "mean", "count"],
-            "status": lambda x: (x == "won").sum(),
-        }).round(4)
-        daily_equity.columns = ["daily_pnl", "avg_pnl", "num_trades", "wins"]
-        daily_equity["cumulative_pnl"] = daily_equity["daily_pnl"].cumsum()
-        daily_equity["win_rate"] = daily_equity["wins"] / daily_equity["num_trades"]
-        daily_equity = daily_equity.reset_index()
+    # Parameters
+    print(f"{'Lookback minutes':<35} {original_params.lookback_minutes:>15} {barbell_params.lookback_minutes:>15}")
+    print(f"{'Price min':<35} {original_params.price_min:>15.2f} {barbell_params.price_min:>15.2f}")
+    print(f"{'Price max':<35} {original_params.price_max:>15.2f} {barbell_params.price_max:>15.2f}")
+    print(f"{'Momentum threshold':<35} {original_params.momentum_threshold:>15.4f} {barbell_params.momentum_threshold:>15.4f}")
+    print(f"{'Stop loss':<35} {original_params.stop_loss:>15.2f} {barbell_params.stop_loss:>15.2f}")
+    print(f"{'-'*35} {'-'*15} {'-'*15}")
 
-        # Merge daily_pnl into equity_df for verification
-        daily_pnl_map = daily_equity.set_index("settlement_date")["daily_pnl"].to_dict()
-        equity_df["daily_pnl"] = equity_df["settlement_date"].map(daily_pnl_map)
+    # Performance metrics
+    print(f"{'OOS Sharpe (daily)':<35} {original_row['oos_sharpe_daily']:>15.4f} {barbell_row['oos_sharpe_daily']:>15.4f}")
+    print(f"{'OOS Sharpe (trade)':<35} {original_row['oos_sharpe_trade']:>15.4f} {barbell_row['oos_sharpe_trade']:>15.4f}")
+    print(f"{'OOS Avg P&L ($)':<35} {original_row['oos_avg_pnl']:>15.4f} {barbell_row['oos_avg_pnl']:>15.4f}")
+    print(f"{'OOS Win Rate (%)':<35} {original_row['oos_win_rate']*100:>15.1f} {barbell_row['oos_win_rate']*100:>15.1f}")
+    print(f"{'OOS Max Drawdown ($)':<35} {original_row['oos_max_drawdown']:>15.4f} {barbell_row['oos_max_drawdown']:>15.4f}")
+    print(f"{'-'*35} {'-'*15} {'-'*15}")
 
-        # Save equity curves
-        equity_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_equity_curve.csv")
-        daily_equity.to_csv(equity_path, index=False)
-        print(f"  Saved: {equity_path}")
+    # Advanced metrics
+    print(f"{'Stability Score':<35} {original_row['stability_score']:>15.2f} {barbell_row['stability_score']:>15.2f}")
+    print(f"{'R-Squared (equity linearity)':<35} {original_row['r_squared']:>15.4f} {barbell_row['r_squared']:>15.4f}")
+    print(f"{'SQN':<35} {original_row['sqn']:>15.4f} {barbell_row['sqn']:>15.4f}")
+    print(f"{'Weighted SQN (barbell)':<35} {original_row['weighted_sqn']:>15.4f} {barbell_row['weighted_sqn']:>15.4f}")
+    print(f"{'Weighted Avg P&L (barbell)':<35} {original_row['weighted_avg_pnl']:>15.4f} {barbell_row['weighted_avg_pnl']:>15.4f}")
+    print(f"{'Volume-Weighted Efficiency (%)':<35} {original_row['volume_weighted_efficiency']*100:>15.1f} {barbell_row['volume_weighted_efficiency']*100:>15.1f}")
+    print(f"{'-'*35} {'-'*15} {'-'*15}")
 
-        # Save detailed trades with verification columns
-        trades_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_trades.csv")
-        equity_df.to_csv(trades_path, index=False)
-        print(f"  Saved: {trades_path}")
+    # Scores
+    print(f"{'Combined Score':<35} {original_row['combined_score']:>15.4f} {barbell_row['combined_score']:>15.4f}")
+    print(f"{'Barbell Score':<35} {original_row['barbell_score']:>15.4f} {barbell_row['barbell_score']:>15.4f}")
+
+    # ==========================================================================
+    # HELPER FUNCTION: Generate trades and equity for a parameter set
+    # ==========================================================================
+
+    def generate_winner_files(params: BacktestParams, row: pd.Series, suffix: str):
+        """Run backtest and save trades/equity files for a winner."""
+        print(f"\nGenerating files for {suffix.upper()} winner...")
+
+        full_result = run_single_backtest(trades_df, btc_prices, params)
+
+        # Log skipped markets
+        missing_scheduled = full_result.get("missing_scheduled_settle", 0)
+        bad_mismatch = full_result.get("bad_schedule_mismatch", 0)
+        stale_count = full_result.get("stale_markets", 0)
+
+        if missing_scheduled > 0:
+            print(f"  Skipped {missing_scheduled} markets (unparseable scheduled settlement time)")
+        if bad_mismatch > 0:
+            print(f"  Skipped {bad_mismatch} markets (schedule vs trade time mismatch > 30 min)")
+        if stale_count > 0:
+            print(f"  Skipped {stale_count} stale markets (no trades in {CONFIG.outcome_window_sec}s outcome window)")
+
+        equity_df = None
+        daily_equity = None
+
+        if full_result["num_trades"] > 0:
+            trades_list = full_result["trades"]
+            equity_df = pd.DataFrame(trades_list)
+
+            # Add cumulative equity (running sum of pnl)
+            equity_df["cumulative_equity"] = equity_df["pnl"].cumsum()
+
+            # Daily aggregation
+            daily_equity = equity_df.groupby("settlement_date").agg({
+                "pnl": ["sum", "mean", "count"],
+                "status": lambda x: (x == "won").sum(),
+            }).round(4)
+            daily_equity.columns = ["daily_pnl", "avg_pnl", "num_trades", "wins"]
+            daily_equity["cumulative_pnl"] = daily_equity["daily_pnl"].cumsum()
+            daily_equity["win_rate"] = daily_equity["wins"] / daily_equity["num_trades"]
+            daily_equity = daily_equity.reset_index()
+
+            # Merge daily_pnl into equity_df for verification
+            daily_pnl_map = daily_equity.set_index("settlement_date")["daily_pnl"].to_dict()
+            equity_df["daily_pnl"] = equity_df["settlement_date"].map(daily_pnl_map)
+
+            # Save equity curve
+            equity_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_equity_curve_{suffix}.csv")
+            daily_equity.to_csv(equity_path, index=False)
+            print(f"  Saved: {equity_path}")
+
+            # Save detailed trades
+            trades_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_trades_{suffix}.csv")
+            equity_df.to_csv(trades_path, index=False)
+            print(f"  Saved: {trades_path}")
+
+        # Save params as JSON (include all metrics)
+        params_dict = params.to_dict()
+        params_dict.update({
+            "oos_sharpe_daily": float(row["oos_sharpe_daily"]),
+            "oos_sharpe_trade": float(row["oos_sharpe_trade"]),
+            "oos_avg_pnl": float(row["oos_avg_pnl"]),
+            "oos_win_rate": float(row["oos_win_rate"]),
+            "oos_max_drawdown": float(row["oos_max_drawdown"]),
+            "stability_score": float(row["stability_score"]),
+            "r_squared": float(row["r_squared"]),
+            "sqn": float(row["sqn"]),
+            "weighted_sqn": float(row["weighted_sqn"]),
+            "weighted_avg_pnl": float(row["weighted_avg_pnl"]),
+            "volume_weighted_efficiency": float(row["volume_weighted_efficiency"]),
+            "combined_score": float(row["combined_score"]),
+            "barbell_score": float(row["barbell_score"]),
+        })
+
+        params_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_params_{suffix}.json")
+        with open(params_path, "w") as f:
+            json.dump(params_dict, f, indent=2)
+        print(f"  Saved: {params_path}")
+
+        return full_result, equity_df, daily_equity
+
+    # ==========================================================================
+    # GENERATE FILES FOR BOTH WINNERS
+    # ==========================================================================
+
+    # Original winner files
+    original_result, original_equity_df, original_daily = generate_winner_files(
+        original_params, original_row, "original"
+    )
+
+    # Barbell winner files (skip backtest if same params)
+    if same_winner:
+        print(f"\n  (Barbell winner same as Original - reusing backtest results)")
+        # Still save separate files with barbell suffix
+        barbell_result = original_result
+
+        if original_equity_df is not None:
+            equity_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_equity_curve_barbell.csv")
+            original_daily.to_csv(equity_path, index=False)
+            print(f"  Saved: {equity_path}")
+
+            trades_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_trades_barbell.csv")
+            original_equity_df.to_csv(trades_path, index=False)
+            print(f"  Saved: {trades_path}")
+
+        # Save barbell params JSON
+        barbell_params_dict = barbell_params.to_dict()
+        barbell_params_dict.update({
+            "oos_sharpe_daily": float(barbell_row["oos_sharpe_daily"]),
+            "oos_sharpe_trade": float(barbell_row["oos_sharpe_trade"]),
+            "oos_avg_pnl": float(barbell_row["oos_avg_pnl"]),
+            "oos_win_rate": float(barbell_row["oos_win_rate"]),
+            "oos_max_drawdown": float(barbell_row["oos_max_drawdown"]),
+            "stability_score": float(barbell_row["stability_score"]),
+            "r_squared": float(barbell_row["r_squared"]),
+            "sqn": float(barbell_row["sqn"]),
+            "weighted_sqn": float(barbell_row["weighted_sqn"]),
+            "weighted_avg_pnl": float(barbell_row["weighted_avg_pnl"]),
+            "volume_weighted_efficiency": float(barbell_row["volume_weighted_efficiency"]),
+            "combined_score": float(barbell_row["combined_score"]),
+            "barbell_score": float(barbell_row["barbell_score"]),
+        })
+        params_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_params_barbell.json")
+        with open(params_path, "w") as f:
+            json.dump(barbell_params_dict, f, indent=2)
+        print(f"  Saved: {params_path}")
+    else:
+        barbell_result, _, _ = generate_winner_files(barbell_params, barbell_row, "barbell")
+
+    # ==========================================================================
+    # SAVE COMMON FILES
+    # ==========================================================================
 
     # Save all results
     results_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_all_results.csv")
     results_df.to_csv(results_path, index=False)
-    print(f"  Saved: {results_path}")
-
-    # Save best params as JSON
-    best_params_dict = best_params.to_dict()
-    best_params_dict.update({
-        "oos_sharpe_daily": float(best_row["oos_sharpe_daily"]),
-        "oos_sharpe_trade": float(best_row["oos_sharpe_trade"]),
-        "oos_avg_pnl": float(best_row["oos_avg_pnl"]),
-        "oos_win_rate": float(best_row["oos_win_rate"]),
-        "oos_max_drawdown": float(best_row["oos_max_drawdown"]),
-        "stability_score": float(best_row["stability_score"]),
-        "r_squared": float(best_row["r_squared"]),
-        "sqn": float(best_row["sqn"]),
-        "weighted_sqn": float(best_row["weighted_sqn"]),
-        "weighted_avg_pnl": float(best_row["weighted_avg_pnl"]),
-        "volume_weighted_efficiency": float(best_row["volume_weighted_efficiency"]),
-        "combined_score": float(best_row["combined_score"]),
-        "barbell_score": float(best_row["barbell_score"]),
-    })
-
-    params_path = os.path.join(LOCAL_OUTPUT_PATH, f"{out_prefix}_best_params.json")
-    with open(params_path, "w") as f:
-        json.dump(best_params_dict, f, indent=2)
-    print(f"  Saved: {params_path}")
+    print(f"\n  Saved: {results_path}")
 
     # Save stability report (top 50 by Sharpe with stability info)
     stability_df = valid_results.nlargest(50, "oos_sharpe_daily")[
@@ -1612,11 +1719,14 @@ def generate_reports(
     print("OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
 
-    # Return results for selftest validation
+    # Return results for selftest validation (use original winner for backward compat)
     return {
-        "full_result": full_result,
-        "best_row": best_row,
-        "best_params": best_params,
+        "full_result": original_result,
+        "best_row": original_row,
+        "best_params": original_params,
+        "barbell_result": barbell_result,
+        "barbell_row": barbell_row,
+        "barbell_params": barbell_params,
     }
 
 
