@@ -1,0 +1,6 @@
+.env
+data/
+reports/
+logs/
+*.parquet
+.pytest_cache/
