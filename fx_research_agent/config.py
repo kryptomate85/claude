@@ -31,7 +31,14 @@ OANDA_HOSTS: Dict[str, str] = {
     "live": "https://api-fxtrade.oanda.com",
 }
 
-# Secrets the default pipeline needs.
+# Candle sources. Dukascopy and Yahoo need no account or key.
+DATA_SOURCES: Tuple[str, ...] = ("dukascopy", "yahoo", "oanda")
+
+# Upper bound for LOOKBACK_DAYS / --lookback. Dukascopy serves many years of
+# history; Yahoo truncates to 60 days on its own.
+MAX_LOOKBACK_DAYS: int = 3650
+
+# Secrets needed only when DATA_SOURCE=oanda.
 SECRET_KEYS: Tuple[str, ...] = (
     "OANDA_API_KEY",
     "OANDA_ACCOUNT_ID",
@@ -114,7 +121,8 @@ class Settings:
     telegram_bot_token: str
     telegram_chat_id: str
 
-    # OANDA / data
+    # Data
+    data_source: str = "dukascopy"
     oanda_environment: str = "practice"
     instrument: str = "EUR_USD"
     granularity: str = "M5"
@@ -177,17 +185,22 @@ class Settings:
         }
 
 
-def load_settings(required: Tuple[str, ...] = SECRET_KEYS) -> Settings:
+def load_settings(required: Tuple[str, ...] = ()) -> Settings:
     """Read, validate and return :class:`Settings`.
 
     Args:
-        required: Names of secret variables that must be present. Defaults to
-            the rule-based pipeline's secrets; add ``LLM_SECRET_KEYS`` when the
-            LLM analyst is enabled.
+        required: Names of secret variables that must be present. The OANDA
+            secrets are added automatically when ``DATA_SOURCE=oanda``; add
+            ``LLM_SECRET_KEYS`` when the LLM analyst is enabled.
 
     Raises:
         ConfigError: If a required variable is missing or a value is invalid.
     """
+    data_source = _env_str("DATA_SOURCE", "dukascopy").lower()
+    if data_source not in DATA_SOURCES:
+        raise ConfigError(f"DATA_SOURCE must be one of {list(DATA_SOURCES)}, got {data_source!r}")
+    if data_source == "oanda":
+        required = tuple(dict.fromkeys(SECRET_KEYS + tuple(required)))
     missing = [key for key in required if not _env_str(key)]
     if missing:
         raise ConfigError(
@@ -223,6 +236,7 @@ def load_settings(required: Tuple[str, ...] = SECRET_KEYS) -> Settings:
         oanda_account_id=_env_str("OANDA_ACCOUNT_ID"),
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_env_str("TELEGRAM_CHAT_ID"),
+        data_source=data_source,
         oanda_environment=environment,
         instrument=_env_str("INSTRUMENT", "EUR_USD").upper(),
         granularity=_env_str("GRANULARITY", "M5").upper(),
@@ -247,8 +261,8 @@ def _validate(settings: Settings) -> None:
     """Cross-field sanity checks; raises :class:`ConfigError` on failure."""
     if settings.granularity != "M5":
         raise ConfigError("Only M5 granularity is supported by the strategy suite.")
-    if not 1 <= settings.lookback_days <= 365:
-        raise ConfigError("LOOKBACK_DAYS must be between 1 and 365.")
+    if not 1 <= settings.lookback_days <= MAX_LOOKBACK_DAYS:
+        raise ConfigError(f"LOOKBACK_DAYS must be between 1 and {MAX_LOOKBACK_DAYS}.")
     if settings.commission < 0.00008:
         raise ConfigError(
             "BACKTEST_COMMISSION must be >= 0.00008 (0.8 pip equivalent cost floor)."
@@ -270,7 +284,7 @@ def _validate(settings: Settings) -> None:
 _SETTINGS: Optional[Settings] = None
 
 
-def get_settings(required: Tuple[str, ...] = SECRET_KEYS) -> Settings:
+def get_settings(required: Tuple[str, ...] = ()) -> Settings:
     """Return a process-wide cached :class:`Settings` instance."""
     global _SETTINGS
     if _SETTINGS is None:

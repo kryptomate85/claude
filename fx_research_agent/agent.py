@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, RateLimitError
 
-from config import Settings, get_settings
+from config import MAX_LOOKBACK_DAYS, Settings, get_settings
 from tools.backtest_runner import run_backtest_suite
 from tools.data_fetcher import fetch_data
 from tools.notifier import send_telegram_message
@@ -66,7 +66,7 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "fetch_data",
             "description": (
-                "Fetch recent complete EUR/USD M5 candles from OANDA, keep only 07:00-20:30 UTC "
+                "Fetch recent complete EUR/USD M5 mid candles (Dukascopy, Yahoo or OANDA), keep only 07:00-20:30 UTC "
                 "bars, save them to Parquet and return a data summary. Falls back to the cached "
                 "file if the API is unavailable (status 'stale_cache')."
             ),
@@ -76,7 +76,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "lookback_days": {
                         "type": "integer",
                         "minimum": 5,
-                        "maximum": 365,
+                        "maximum": MAX_LOOKBACK_DAYS,
                         "description": "Calendar days of history. Omit to use the configured default.",
                     }
                 },

@@ -82,7 +82,8 @@ def build_report(
     lines = [
         "*EUR/USD Intraday Research Report*",
         f"Data: {data.get('start_utc', '?')[:10]} → {data.get('end_utc', '?')[:10]}, "
-        f"{data.get('bars')} bars, {data.get('trading_days')} days, 07:00-20:30 UTC",
+        f"{data.get('bars')} bars, {data.get('trading_days')} days, 07:00-20:30 UTC"
+        + (f", source {data_result['source']}" if data_result and data_result.get("source") else ""),
         f"Costs: ~{assumptions.get('approx_round_trip_cost_pips')} pips round trip | "
         f"Overnight violations: {report.get('overnight_violations_total')}",
     ]

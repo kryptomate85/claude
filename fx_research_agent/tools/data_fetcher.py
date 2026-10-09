@@ -1,10 +1,15 @@
-"""OANDA v20 candle ingestion.
+"""Candle ingestion from Dukascopy (default, no key), Yahoo (no key) or OANDA v20.
 
-Pulls recent *complete* M5 mid-price candles for an instrument from
-``/v3/instruments/{instrument}/candles``, paginating forward in 5000-candle
-pages, filters them strictly to the liquid London + New York daytime window
-(07:00–20:30 UTC bar-open times, inclusive) and persists them as Parquet
-(e.g. ``data/EUR_USD_M5.parquet``).
+Pulls recent *complete* M5 candles for an instrument from one of:
+
+* Dukascopy's public datafeed: daily 1-minute bid and ask files, averaged to
+  mid and resampled to M5.
+* Yahoo Finance's chart API: native M5 bars, last 60 days only.
+* OANDA's ``/v3/instruments/{instrument}/candles``: M5 mid candles, paginated
+  forward in 5000-candle pages.
+ Candles are filtered strictly to the
+liquid London + New York daytime window (07:00–20:30 UTC bar-open times,
+inclusive) and persisted as Parquet (e.g. ``data/EUR_USD_M5.parquet``).
 
 If the API is unreachable, the previously cached Parquet file is used as a
 fallback so that the pipeline can still proceed (and the result says so).
@@ -13,21 +18,33 @@ fallback so that the pipeline can still proceed (and the result says so).
 from __future__ import annotations
 
 import logging
+import lzma
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import requests
 
-from config import SessionWindow, Settings, get_settings
+from config import MAX_LOOKBACK_DAYS, SessionWindow, Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
 MAX_CANDLES_PER_REQUEST = 5000
 MAX_PAGES = 200
 REQUIRED_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+DUKASCOPY_URL = "https://datafeed.dukascopy.com/datafeed/{symbol}/{year}/{month:02d}/{day:02d}/{side}_candles_min_1.bi5"
+# One record per minute: seconds into the day, open, close, low, high (big-endian
+# int32 in price points) and volume (big-endian float32).
+DUKASCOPY_RECORD = np.dtype([("sec", ">i4"), ("o", ">i4"), ("c", ">i4"), ("l", ">i4"), ("h", ">i4"), ("v", ">f4")])
+DUKASCOPY_PAUSE_SEC = 0.25  # pacing between requests; the feed rate-limits bursts
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_INTERVALS = {"M5": ("5m", 5), "M15": ("15m", 15), "M30": ("30m", 30), "H1": ("60m", 60)}
+YAHOO_MAX_DAYS = 59  # Yahoo serves intraday bars for the last 60 days only
+RESAMPLE_RULES = {"M1": "1min", "M5": "5min", "M15": "15min", "M30": "30min", "H1": "1h"}
 
 
 class DataFetchError(RuntimeError):
@@ -170,6 +187,235 @@ class OandaClient:
         return df[REQUIRED_COLUMNS]
 
 
+class DukascopyClient:
+    """Client for Dukascopy's public datafeed (no account or API key needed).
+
+    Each weekday is one request per price side. Files for completed days never
+    change, so they are cached under ``data/dukascopy/`` and reruns only
+    download new days.
+    """
+
+    def __init__(self, settings: Settings, session: Optional[requests.Session] = None) -> None:
+        """Create a client that caches raw day files under the data directory."""
+        self.settings = settings
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": "fx-research-agent/1.0"})
+        self.cache_dir = settings.data_dir / "dukascopy"
+
+    def _get(self, url: str, retries: int = 6) -> Optional[bytes]:
+        """GET ``url`` with retries for timeouts, resets, 429 and 5xx responses.
+
+        Returns:
+            The response body, or ``None`` when the feed has no file (404).
+
+        Raises:
+            DataFetchError: When all retries are exhausted or the request is refused.
+        """
+        last_error = "unknown error"
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.get(url, timeout=self.settings.http_timeout)
+            except requests.RequestException as exc:
+                last_error = f"connection error: {exc}"
+            else:
+                if resp.status_code == 200:
+                    return resp.content
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code != 429 and resp.status_code < 500:
+                    raise DataFetchError(f"Dukascopy request failed ({resp.status_code}) for {url}")
+                last_error = f"HTTP {resp.status_code}"
+            logger.warning("Dukascopy %s (attempt %d/%d)", last_error, attempt, retries)
+            time.sleep(min(2**attempt, 30))
+        raise DataFetchError(f"Dukascopy request failed after {retries} attempts: {last_error}")
+
+    def _day_file(self, symbol: str, day: pd.Timestamp, side: str) -> Optional[bytes]:
+        """Return one day's compressed 1-minute file, from cache when possible."""
+        cached = self.cache_dir / symbol / f"{day:%Y-%m-%d}_{side}.bi5"
+        if cached.exists():
+            return cached.read_bytes()
+        # Dukascopy months are zero-based.
+        url = DUKASCOPY_URL.format(symbol=symbol, year=day.year, month=day.month - 1, day=day.day, side=side)
+        body = self._get(url)
+        time.sleep(DUKASCOPY_PAUSE_SEC)
+        if body is not None:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(body)
+        return body
+
+    def fetch_candles(
+        self,
+        instrument: str,
+        granularity: str,
+        start: datetime,
+        end: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        """Fetch mid-price candles for whole weekdays between ``start`` and ``end``.
+
+        Bid and ask 1-minute bars are averaged to mid, minutes with no ticks
+        (zero volume) are dropped, and the result is resampled to ``granularity``.
+        The current UTC day is excluded because its file is not published yet.
+
+        Args:
+            instrument: OANDA-style instrument name, e.g. ``"EUR_USD"``.
+            granularity: Candle granularity, e.g. ``"M5"``.
+            start: Inclusive UTC start time.
+            end: Exclusive UTC end time (defaults to now).
+
+        Returns:
+            DataFrame indexed by UTC bar-open time with columns
+            ``Open, High, Low, Close, Volume``.
+        """
+        if granularity not in RESAMPLE_RULES:
+            raise DataFetchError(f"Unsupported granularity for Dukascopy: {granularity}")
+        symbol = instrument.replace("_", "").upper()
+        point = 1e3 if symbol.endswith("JPY") else 1e5
+        end = end or datetime.now(timezone.utc)
+        today = pd.Timestamp(datetime.now(timezone.utc)).normalize()
+        first = pd.Timestamp(start).normalize()
+        last = min(pd.Timestamp(end).ceil("D"), today)
+        days = [d for d in pd.date_range(first, last, freq="D", inclusive="left") if d.dayofweek < 5]
+
+        frames: List[pd.DataFrame] = []
+        for i, day in enumerate(days, 1):
+            sides = [_decode_day(self._day_file(symbol, day, side), day, point) for side in ("BID", "ASK")]
+            if any(side.empty for side in sides):
+                continue
+            bid, ask = sides[0].align(sides[1], join="inner")
+            mid = (bid[["Open", "High", "Low", "Close"]] + ask[["Open", "High", "Low", "Close"]]) / 2
+            mid["Volume"] = bid["Volume"] + ask["Volume"]
+            frames.append(mid[mid["Volume"] > 0])
+            if i % 20 == 0 or i == len(days):
+                logger.info("Dukascopy %s: %d/%d days fetched (through %s)", symbol, i, len(days), day.date())
+
+        if not frames:
+            raise DataFetchError(f"No Dukascopy candles returned for {symbol}.")
+        minute = pd.concat(frames)
+        df = (
+            minute.resample(RESAMPLE_RULES[granularity], label="left", closed="left")
+            .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+            .dropna(subset=["Open"])
+        )
+        df = df[(df.index >= pd.Timestamp(start)) & (df.index < pd.Timestamp(end))]
+        df.index.name = "time"
+        return df[REQUIRED_COLUMNS]
+
+
+def _decode_day(body: Optional[bytes], day: pd.Timestamp, point: float) -> pd.DataFrame:
+    """Decode one Dukascopy ``*_candles_min_1.bi5`` file into a 1-minute frame."""
+    if not body:
+        return pd.DataFrame(columns=REQUIRED_COLUMNS)
+    try:
+        raw = np.frombuffer(lzma.decompress(body), dtype=DUKASCOPY_RECORD)
+    except (lzma.LZMAError, ValueError) as exc:
+        raise DataFetchError(f"Corrupt Dukascopy file for {day.date()}: {exc}") from exc
+    index = day + pd.to_timedelta(raw["sec"].astype(np.int64), unit="s")
+    return pd.DataFrame(
+        {
+            "Open": raw["o"] / point,
+            "High": raw["h"] / point,
+            "Low": raw["l"] / point,
+            "Close": raw["c"] / point,
+            "Volume": raw["v"].astype(float),
+        },
+        index=index,
+    )
+
+
+class YahooClient:
+    """Client for Yahoo Finance's chart API (no account or API key needed).
+
+    Intraday history is limited to the last 60 days; longer lookbacks are
+    truncated with a warning. Yahoo reports no FX volume, so ``Volume`` is 0.
+    """
+
+    def __init__(self, settings: Settings, session: Optional[requests.Session] = None) -> None:
+        """Create a client; Yahoo refuses requests without a browser-like User-Agent."""
+        self.settings = settings
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    def _get(self, url: str, params: Dict[str, Any], retries: int = 4) -> Dict[str, Any]:
+        """GET ``url`` with retries for timeouts, truncated bodies, 429 and 5xx."""
+        last_error = "unknown error"
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.get(url, params=params, timeout=self.settings.http_timeout)
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code != 429 and resp.status_code < 500:
+                    raise DataFetchError(f"Yahoo request failed ({resp.status_code}): {resp.text[:300]}")
+                last_error = f"HTTP {resp.status_code}"
+            except (requests.RequestException, ValueError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Yahoo %s (attempt %d/%d)", last_error, attempt, retries)
+            time.sleep(min(2**attempt, 16))
+        raise DataFetchError(f"Yahoo request failed after {retries} attempts: {last_error}")
+
+    def fetch_candles(
+        self,
+        instrument: str,
+        granularity: str,
+        start: datetime,
+        end: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        """Fetch complete candles between ``start`` and ``end`` (at most 60 days back).
+
+        Args:
+            instrument: OANDA-style instrument name, e.g. ``"EUR_USD"``.
+            granularity: Candle granularity, e.g. ``"M5"``.
+            start: Inclusive UTC start time.
+            end: Exclusive UTC end time (defaults to now).
+
+        Returns:
+            DataFrame indexed by UTC bar-open time with columns
+            ``Open, High, Low, Close, Volume``.
+        """
+        if granularity not in YAHOO_INTERVALS:
+            raise DataFetchError(f"Unsupported granularity for Yahoo: {granularity}")
+        interval, minutes = YAHOO_INTERVALS[granularity]
+        now = datetime.now(timezone.utc)
+        end = min(end or now, now)
+        earliest = now - timedelta(days=YAHOO_MAX_DAYS)
+        if start < earliest:
+            logger.warning("Yahoo keeps 60 days of intraday bars; starting at %s", earliest.date())
+            start = earliest
+        symbol = instrument.replace("_", "").upper() + "=X"
+        params = {"interval": interval, "period1": int(start.timestamp()), "period2": int(end.timestamp())}
+        chart = self._get(YAHOO_URL.format(symbol=symbol), params).get("chart") or {}
+        if chart.get("error") or not chart.get("result"):
+            raise DataFetchError(f"Yahoo returned no data for {symbol}: {chart.get('error')}")
+        result = chart["result"][0]
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        df = pd.DataFrame(
+            {
+                "Open": quote.get("open"),
+                "High": quote.get("high"),
+                "Low": quote.get("low"),
+                "Close": quote.get("close"),
+                "Volume": 0,
+            },
+            index=pd.to_datetime(result.get("timestamp", []), unit="s", utc=True),
+        ).dropna(subset=["Open", "High", "Low", "Close"])
+        # Keep complete bars only: the newest bar is still forming until its close time.
+        df = df[df.index + pd.Timedelta(minutes=minutes) <= pd.Timestamp(end)]
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        df = df[df.index >= pd.Timestamp(start)]
+        if df.empty:
+            raise DataFetchError(f"No complete Yahoo candles for {symbol}.")
+        df.index.name = "time"
+        return df[REQUIRED_COLUMNS]
+
+
+def make_client(settings: Settings) -> Any:
+    """Return the candle client for ``settings.data_source``."""
+    if settings.data_source == "oanda":
+        return OandaClient(settings)
+    if settings.data_source == "yahoo":
+        return YahooClient(settings)
+    return DukascopyClient(settings)
+
+
 def filter_liquid_hours(df: pd.DataFrame, window: SessionWindow) -> pd.DataFrame:
     """Keep only bars whose UTC open time lies inside ``window`` on weekdays.
 
@@ -263,13 +509,13 @@ def fetch_data(lookback_days: Optional[int] = None, settings: Optional[Settings]
     """
     settings = settings or get_settings()
     days = int(lookback_days or settings.lookback_days)
-    days = max(1, min(days, 365))
+    days = max(1, min(days, MAX_LOOKBACK_DAYS))
     path = settings.parquet_path
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
     try:
-        client = OandaClient(settings)
+        client = make_client(settings)
         raw = client.fetch_candles(settings.instrument, settings.granularity, start, end)
         filtered = filter_liquid_hours(raw, settings.liquid_window)
         if filtered.empty:
@@ -284,7 +530,7 @@ def fetch_data(lookback_days: Optional[int] = None, settings: Optional[Settings]
         )
         return {
             "status": "ok",
-            "source": "oanda",
+            "source": settings.data_source,
             "instrument": settings.instrument,
             "granularity": settings.granularity,
             "lookback_days": days,

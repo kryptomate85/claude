@@ -17,7 +17,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from typing import List, Optional
 
-from config import LLM_SECRET_KEYS, PROJECT_ROOT, SECRET_KEYS, ConfigError, Settings, load_settings, set_settings
+from config import LLM_SECRET_KEYS, MAX_LOOKBACK_DAYS, PROJECT_ROOT, ConfigError, Settings, load_settings, set_settings
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -96,17 +96,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_logging(args.verbose)
     log = logging.getLogger("main")
 
-    required = SECRET_KEYS + (LLM_SECRET_KEYS if args.llm else ())
+    required = LLM_SECRET_KEYS if args.llm else ()
     try:
         settings = load_settings(required)
         if args.lookback:
-            settings = dataclasses.replace(settings, lookback_days=max(1, min(args.lookback, 365)))
+            settings = dataclasses.replace(settings, lookback_days=max(1, min(args.lookback, MAX_LOOKBACK_DAYS)))
     except ConfigError as exc:
         log.error("Configuration error: %s", exc)
         return 2
     set_settings(settings)
     log.info(
-        "Starting research pipeline | instrument=%s granularity=%s lookback=%dd model=%s env=%s output=%s",
+        "Starting research pipeline | source=%s instrument=%s granularity=%s lookback=%dd model=%s env=%s output=%s",
+        settings.data_source,
         settings.instrument,
         settings.granularity,
         settings.lookback_days,

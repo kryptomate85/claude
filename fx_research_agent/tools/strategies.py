@@ -19,6 +19,8 @@ Strategies:
 * ``london_momentum``      – EMA crossover momentum, entries 07:30–15:00 UTC.
 * ``ny_mean_reversion``    – RSI extreme fade, entries 12:30–18:30 UTC.
 * ``london_orb``           – 07:00–08:00 opening-range breakout, entries 08:00–11:00 UTC.
+* ``us_release_fade``      – fade an outsized 08:00–09:00 New York hour (US 8:30 ET data
+  releases), entry at 09:00 ET, exit 20:00 UTC.
 """
 
 from __future__ import annotations
@@ -103,6 +105,41 @@ def opening_range(
     rng_high = rng_high.where(published)
     rng_low = rng_low.where(published)
     return np.vstack([rng_high.to_numpy(), rng_low.to_numpy()])
+
+
+def release_hour_fade(
+    index: pd.DatetimeIndex,
+    open_: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    k: float = 2.0,
+    window: int = 20,
+) -> np.ndarray:
+    """Fade direction after an outsized US release hour (08:00–09:00 New York time).
+
+    For each day, the release hour's range (as a fraction of its open) is
+    compared with ``k`` × the median of the previous ``window`` days' release
+    hours. On a spike, the value on the hour's *last* bar is the opposite sign
+    of the hour's move (+1 long, -1 short); every other bar is 0. The value
+    uses only that bar and earlier data, so with ``trade_on_close=True`` the
+    entry fills at the 09:00 New York price.
+    """
+    et = index.tz_convert("America/New_York")
+    in_hour = np.asarray(et.hour == 8)
+    out = np.zeros(len(index))
+    if not in_hour.any():
+        return out
+    df = pd.DataFrame({"o": open_, "h": high, "l": low, "c": close}, index=index)[in_hour]
+    day = index[in_hour].normalize()
+    hour = df.groupby(day).agg(o=("o", "first"), h=("h", "max"), l=("l", "min"), c=("c", "last"))
+    rng = (hour["h"] - hour["l"]) / hour["o"]
+    baseline = rng.rolling(window, min_periods=15).median().shift(1)
+    fade = (-np.sign(hour["c"] - hour["o"])).where(rng > k * baseline, 0.0).fillna(0.0)
+    positions = np.flatnonzero(in_hour)
+    last_in_day = pd.Series(positions, index=day).groupby(level=0).max()
+    out[last_in_day.to_numpy()] = fade.reindex(last_in_day.index).to_numpy()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -326,14 +363,71 @@ class LondonOpeningRangeBreakout(IntradaySessionStrategy):
             self._last_trade_day = today
 
 
+# ---------------------------------------------------------------------------
+# Strategy D: US Data-Release Fade (fundamental event + technical trigger)
+# ---------------------------------------------------------------------------
+
+
+class USReleaseFade(IntradaySessionStrategy):
+    """Fade outsized moves in the US 8:30 ET data-release hour.
+
+    Scheduled US releases (CPI, retail sales, GDP, payrolls, claims) come out
+    at 08:30 New York time. When the 08:00–09:00 New York hour's range exceeds
+    ``k`` × its trailing ``window``-day median, enter against that hour's move
+    at 09:00 New York time and hold, without stop or target, until
+    ``exit_minute`` (20:00 UTC) or the hard liquidation.
+
+    The rule was specified before testing (k=2, exit 20:00). On 2.8 years of
+    Yahoo H1 EUR/USD it netted about +6.6 bp per trade (n≈100, t≈2.2) after
+    costs, but it was weaker on other USD pairs, so treat it as a candidate to
+    validate on longer M5 data, not a proven edge.
+    """
+
+    k: float = 2.0
+    window: int = 20
+    exit_minute: int = 20 * 60
+    entry_start: int = 12 * 60  # 08:55 New York is 12:55 UTC (EDT) or 13:55 UTC (EST)
+    entry_end: int = 15 * 60
+
+    def setup(self) -> None:
+        """Register the release-hour fade signal."""
+        self.signal = self.I(
+            release_hour_fade,
+            self.data.index,
+            self.data.Open,
+            self.data.High,
+            self.data.Low,
+            self.data.Close,
+            self.k,
+            self.window,
+            name="release_fade",
+            plot=False,
+        )
+
+    def on_bar(self, now: int) -> None:
+        """Enter on the signal bar; exit at ``exit_minute``."""
+        if self.position and now >= self.exit_minute:
+            self.position.close()
+            return
+        if self.position or not self.in_entry_window(now):
+            return
+        signal = self.signal[-1]
+        if signal > 0:
+            self.buy(size=self.size)
+        elif signal < 0:
+            self.sell(size=self.size)
+
+
 STRATEGIES: Dict[str, Type[IntradaySessionStrategy]] = {
     "london_momentum": LondonMomentum,
     "ny_mean_reversion": NYMeanReversion,
     "london_orb": LondonOpeningRangeBreakout,
+    "us_release_fade": USReleaseFade,
 }
 
 STRATEGY_DESCRIPTIONS: Dict[str, str] = {
     "london_momentum": "London Session Momentum: EMA(9/21) crossover with range-expansion filter, entries 07:30-15:00 UTC, 1.5/3.0 ATR stop/target.",
     "ny_mean_reversion": "New York Session Mean Reversion: RSI(14) 30/70 re-entry fade, exit at RSI 50, entries 12:30-18:30 UTC, 2.0 ATR stop/target.",
     "london_orb": "London Opening Range Breakout: 07:00-08:00 UTC range, entries 08:00-11:00 UTC, stop at opposite range edge, 1.5R target, 1 trade/day.",
+    "us_release_fade": "US Data-Release Fade: when the 08:00-09:00 New York hour (8:30 ET releases) ranges > 2x its 20-day median, fade its move from 09:00 New York to 20:00 UTC, no stop/target.",
 }

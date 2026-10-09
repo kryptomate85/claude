@@ -7,7 +7,7 @@ import pandas as pd
 
 from tools.backtest_runner import run_backtest_suite, run_single_backtest, split_by_days
 from tools.data_fetcher import filter_liquid_hours
-from tools.strategies import STRATEGIES, IntradaySessionStrategy, opening_range
+from tools.strategies import STRATEGIES, IntradaySessionStrategy, opening_range, release_hour_fade
 
 
 class AlwaysLong(IntradaySessionStrategy):
@@ -70,6 +70,22 @@ def test_all_strategies_respect_constraint(candles: pd.DataFrame, settings) -> N
         assert (_exit_minutes(trades) <= 20 * 60 + 25).all(), name
         entry_mod = entry.dt.hour * 60 + entry.dt.minute
         assert (entry_mod >= cls.entry_start).all() and (entry_mod <= cls.entry_end).all(), name
+
+
+def test_release_fade_signal_on_spike_day_only() -> None:
+    """A spike day gets one fade signal on the last bar of the 08:00 New York hour; calm days get none."""
+    idx = pd.date_range("2026-06-01 07:00", "2026-07-31 20:30", freq="5min", tz="UTC")
+    idx = idx[(idx.dayofweek < 5) & (idx.hour * 60 + idx.minute >= 420) & (idx.hour * 60 + idx.minute <= 1230)]
+    close = np.full(len(idx), 1.10)
+    high, low = close + 0.0001, close - 0.0001
+    spike_day = pd.Timestamp("2026-07-15", tz="UTC")
+    hour = (idx.normalize() == spike_day) & (idx.hour == 12)  # 08:00-09:00 EDT
+    close[hour] += np.linspace(0.0002, 0.002, hour.sum())  # 20-pip rally inside the hour
+    high = np.maximum(high, close + 0.0001)
+    sig = release_hour_fade(idx, close, high, low, close)
+    hits = np.flatnonzero(sig)
+    assert len(hits) == 1 and sig[hits[0]] == -1.0  # up-move faded with a short
+    assert idx[hits[0]] == pd.Timestamp("2026-07-15 12:55", tz="UTC")
 
 
 def test_opening_range_has_no_lookahead(candles: pd.DataFrame) -> None:

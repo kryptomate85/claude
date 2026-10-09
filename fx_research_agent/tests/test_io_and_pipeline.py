@@ -1,11 +1,14 @@
-"""Tests for notifier chunking, OANDA parsing, config and the default pipeline (offline)."""
+"""Tests for notifier chunking, OANDA/Dukascopy parsing, config and the default pipeline (offline)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import lzma
 from pathlib import Path
 from typing import Any, List
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -71,6 +74,7 @@ def test_oanda_client_parses_and_drops_incomplete(settings) -> None:
 
 
 def test_fetch_data_falls_back_to_cache(settings, candles, monkeypatch) -> None:
+    settings = dataclasses.replace(settings, data_source="oanda")
     settings.parquet_path.parent.mkdir(parents=True)
     candles.to_parquet(settings.parquet_path)
 
@@ -83,13 +87,94 @@ def test_fetch_data_falls_back_to_cache(settings, candles, monkeypatch) -> None:
 
 
 def test_fetch_data_error_without_cache(settings, monkeypatch) -> None:
+    settings = dataclasses.replace(settings, data_source="oanda")
     monkeypatch.setattr(data_fetcher.OandaClient, "fetch_candles", lambda *a, **k: (_ for _ in ()).throw(data_fetcher.DataFetchError("down")))
     assert data_fetcher.fetch_data(settings=settings)["status"] == "error"
+
+
+def _bi5(day_seconds: List[int], price: int, volume: float) -> bytes:
+    """Build a Dukascopy 1-minute file with flat bars at ``price`` points."""
+    rec = np.zeros(len(day_seconds), dtype=data_fetcher.DUKASCOPY_RECORD)
+    rec["sec"], rec["v"] = day_seconds, volume
+    for col in ("o", "c", "l", "h"):
+        rec[col] = price
+    rec["h"] += 2
+    return lzma.compress(rec.tobytes(), format=lzma.FORMAT_ALONE)
+
+
+class FakeFeed:
+    """Serves BID/ASK files for 2026-06-01 (a Monday) and 404 for every other day."""
+
+    def __init__(self, first_status: int = 200) -> None:
+        self.headers: dict = {}
+        self.urls: List[str] = []
+        self.first_status = first_status
+
+    def get(self, url: str, timeout: float) -> FakeResponse:
+        self.urls.append(url)
+        if self.first_status != 200:
+            status, self.first_status = self.first_status, 200
+            return FakeResponse(status, {})
+        if "/2026/05/01/" not in url:  # Dukascopy months are zero-based
+            return FakeResponse(404, {})
+        seconds = [7 * 3600 + 60 * m for m in range(10)]
+        resp = FakeResponse(200, {})
+        if "BID" in url:
+            resp.content = _bi5(seconds, 108000, 1.0)
+        else:  # last minute has no ticks on the ask side -> dropped
+            resp.content = _bi5(seconds[:-1], 108010, 1.0)
+        return resp
+
+
+@pytest.fixture()
+def no_sleep(monkeypatch) -> None:
+    monkeypatch.setattr(data_fetcher.time, "sleep", lambda _s: None)
+
+
+def test_dukascopy_mid_resample_and_cache(settings, no_sleep) -> None:
+    feed = FakeFeed()
+    client = data_fetcher.DukascopyClient(settings, session=feed)
+    start, end = pd.Timestamp("2026-05-30", tz="UTC"), pd.Timestamp("2026-06-03", tz="UTC")
+    df = client.fetch_candles("EUR_USD", "M5", start.to_pydatetime(), end.to_pydatetime())
+    assert list(df.index.strftime("%H:%M")) == ["07:00", "07:05"]
+    assert df["Open"].iloc[0] == pytest.approx(1.08005) and df["High"].iloc[0] == pytest.approx(1.08007)
+    assert df["Volume"].tolist() == [10.0, 8.0]  # 07:09 has no ask bar
+    assert len(feed.urls) == 4 and not any("/2026/04/30/" in u or "/2026/04/31/" in u for u in feed.urls)  # weekend skipped
+    client.fetch_candles("EUR_USD", "M5", start.to_pydatetime(), end.to_pydatetime())
+    assert len(feed.urls) == 6  # 2026-06-01 served from cache; 404 days are retried
+
+
+def test_dukascopy_retries_rate_limit(settings, no_sleep) -> None:
+    client = data_fetcher.DukascopyClient(settings, session=FakeFeed(first_status=429))
+    df = client.fetch_candles("EUR_USD", "M5", pd.Timestamp("2026-06-01", tz="UTC").to_pydatetime(), pd.Timestamp("2026-06-02", tz="UTC").to_pydatetime())
+    assert len(df) == 2
+
+
+def test_yahoo_parses_and_drops_forming_bar(settings, no_sleep, monkeypatch) -> None:
+    now = pd.Timestamp("2026-06-01T08:12:00", tz="UTC")
+    monkeypatch.setattr(data_fetcher, "datetime", type("FrozenDT", (data_fetcher.datetime,), {"now": staticmethod(lambda tz=None: now.to_pydatetime())}))
+    times = [int(pd.Timestamp(f"2026-06-01T{t}", tz="UTC").timestamp()) for t in ("08:00", "08:05", "08:10")]
+    quote = {"open": [1.1, None, 1.2], "high": [1.2, None, 1.3], "low": [1.0, None, 1.1], "close": [1.15, None, 1.25], "volume": [0, 0, 0]}
+    payload = {"chart": {"result": [{"timestamp": times, "indicators": {"quote": [quote]}}], "error": None}}
+    session = FakeSession([FakeResponse(429, {}), FakeResponse(200, payload)])
+    df = data_fetcher.YahooClient(settings, session=session).fetch_candles("EUR_USD", "M5", (now - pd.Timedelta(days=90)).to_pydatetime())
+    assert list(df.index.strftime("%H:%M")) == ["08:00"]  # null bar dropped, 08:10 still forming
+    assert session.calls[-1]["period1"] == int((now - pd.Timedelta(days=data_fetcher.YAHOO_MAX_DAYS)).timestamp())
+
+
+def test_default_source_needs_no_keys(monkeypatch) -> None:
+    for key in config.SECRET_KEYS + config.LLM_SECRET_KEYS + config.TELEGRAM_SECRET_KEYS + ("DATA_SOURCE",):
+        monkeypatch.delenv(key, raising=False)
+    assert config.load_settings().data_source == "dukascopy"
+    monkeypatch.setenv("DATA_SOURCE", "oanda")
+    with pytest.raises(config.ConfigError, match="OANDA_API_KEY"):
+        config.load_settings()
 
 
 def test_config_only_requires_oanda(monkeypatch) -> None:
     for key in config.LLM_SECRET_KEYS + config.TELEGRAM_SECRET_KEYS:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DATA_SOURCE", "oanda")
     for key in config.SECRET_KEYS:
         monkeypatch.setenv(key, "x")
     loaded = config.load_settings()
