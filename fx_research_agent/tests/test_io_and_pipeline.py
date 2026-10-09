@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, List
 
 import pandas as pd
@@ -86,11 +87,13 @@ def test_fetch_data_error_without_cache(settings, monkeypatch) -> None:
     assert data_fetcher.fetch_data(settings=settings)["status"] == "error"
 
 
-def test_config_does_not_require_openai(monkeypatch) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def test_config_only_requires_oanda(monkeypatch) -> None:
+    for key in config.LLM_SECRET_KEYS + config.TELEGRAM_SECRET_KEYS:
+        monkeypatch.delenv(key, raising=False)
     for key in config.SECRET_KEYS:
         monkeypatch.setenv(key, "x")
-    assert config.load_settings().openai_api_key == ""
+    loaded = config.load_settings()
+    assert loaded.openai_api_key == "" and not loaded.telegram_enabled
     with pytest.raises(config.ConfigError, match="OPENAI_API_KEY"):
         config.load_settings(config.SECRET_KEYS + config.LLM_SECRET_KEYS)
 
@@ -114,6 +117,25 @@ def test_default_pipeline_needs_no_llm(settings, candles, monkeypatch) -> None:
     monkeypatch.setattr(fetcher, "fetch_data", lambda **k: {"status": "ok"})
     real_suite = runner.run_backtest_suite
     monkeypatch.setattr(runner, "run_backtest_suite", lambda **k: real_suite(settings=settings, data=candles, **k))
-    summary = main.run_pipeline()
-    assert summary["status"] == "ok"
+    summary = main.run_pipeline(settings)
+    assert summary["status"] == "ok" and summary["telegram"] is False
     assert sent[0].startswith("🚀") and "*Scorecard*" in sent[-1]
+    saved = Path(summary["markdown_path"])
+    assert saved.parent == settings.reports_dir and saved.read_text().strip() == sent[-1]
+
+
+def test_half_configured_telegram_is_rejected(monkeypatch) -> None:
+    for key in config.SECRET_KEYS:
+        monkeypatch.setenv(key, "x")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(config.ConfigError, match="TELEGRAM_CHAT_ID"):
+        config.load_settings()
+
+
+def test_disabled_notifier_logs_to_console(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="tools.notifier"):
+        assert TelegramNotifier("", "").send("*Report*\nbody") is False
+    assert "[console] Report" in caplog.text

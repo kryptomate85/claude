@@ -17,7 +17,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from typing import List, Optional
 
-from config import LLM_SECRET_KEYS, PROJECT_ROOT, SECRET_KEYS, ConfigError, load_settings, set_settings
+from config import LLM_SECRET_KEYS, PROJECT_ROOT, SECRET_KEYS, ConfigError, Settings, load_settings, set_settings
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -58,12 +58,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def run_pipeline() -> dict:
-    """Run fetch → backtest → rule-based report. This is the default; no LLM is used."""
+def run_pipeline(settings: Settings) -> dict:
+    """Run fetch → backtest → rule-based report. This is the default; no LLM is used.
+
+    The report is always printed to stdout and saved under ``reports/``; it is
+    also sent to Telegram when Telegram is configured.
+    """
     from tools.backtest_runner import run_backtest_suite
     from tools.data_fetcher import fetch_data
     from tools.notifier import send_telegram_message
-    from tools.report import build_report
+    from tools.report import build_report, save_report_markdown
 
     send_telegram_message("🚀 *EUR/USD research pipeline started*")
     data_result = fetch_data()
@@ -74,8 +78,16 @@ def run_pipeline() -> dict:
     if report.get("status") != "ok":
         send_telegram_message(f"❌ *Backtest suite failed*: `{report.get('error')}`")
         return {"status": "backtest_error", "error": report.get("error")}
-    send_telegram_message(build_report(report, data_result))
-    return {"status": "ok", "report_path": report.get("report_path")}
+    text = build_report(report, data_result)
+    markdown_path = save_report_markdown(text, settings.reports_dir)
+    print("\n" + text + "\n", flush=True)
+    send_telegram_message(text)
+    return {
+        "status": "ok",
+        "report_path": report.get("report_path"),
+        "markdown_path": str(markdown_path) if markdown_path else None,
+        "telegram": settings.telegram_enabled,
+    }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -94,12 +106,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     set_settings(settings)
     log.info(
-        "Starting research pipeline | instrument=%s granularity=%s lookback=%dd model=%s env=%s",
+        "Starting research pipeline | instrument=%s granularity=%s lookback=%dd model=%s env=%s output=%s",
         settings.instrument,
         settings.granularity,
         settings.lookback_days,
         settings.openai_model if args.llm else "none (rule-based report)",
         settings.oanda_environment,
+        "console + telegram" if settings.telegram_enabled else "console only",
     )
     log.debug("Secrets: %s", settings.masked())
 
@@ -112,7 +125,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             summary = ResearchAgent(settings).run()
         else:
-            summary = run_pipeline()
+            summary = run_pipeline(settings)
     except KeyboardInterrupt:
         log.warning("Interrupted by user.")
         return 130

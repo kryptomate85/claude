@@ -9,7 +9,29 @@ inputs.
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def save_report_markdown(text: str, reports_dir: Path) -> Optional[Path]:
+    """Write a final report to ``reports/research_report_<UTC stamp>.md``.
+
+    Returns the path, or None if the file could not be written.
+    """
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = reports_dir / f"research_report_{stamp}.md"
+        path.write_text(text + "\n", encoding="utf-8")
+        logger.info("Research report written to %s", path)
+        return path
+    except OSError as exc:
+        logger.error("Could not write research report: %s", exc)
+        return None
 
 
 def _v(value: Any, suffix: str = "") -> str:

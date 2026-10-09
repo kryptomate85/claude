@@ -7,7 +7,7 @@ requires the ``openai`` package and ``OPENAI_API_KEY``.
 The model is given three tools — ``fetch_data``, ``run_backtest_suite`` and
 ``send_telegram_update`` — and a system prompt instructing it to announce the
 run, refresh data, run the backtest suite, analyse the metrics as a senior
-quant, and publish a Markdown report to Telegram.
+quant, and publish a Markdown report (Telegram if configured, else console + file).
 
 Reliability guarantees enforced *outside* the model:
 
@@ -33,7 +33,7 @@ from config import Settings, get_settings
 from tools.backtest_runner import run_backtest_suite
 from tools.data_fetcher import fetch_data
 from tools.notifier import send_telegram_message
-from tools.report import build_report
+from tools.report import build_report, save_report_markdown
 from tools.strategies import STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,10 @@ TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "send_telegram_update",
-            "description": "Send a Telegram legacy-Markdown message to the research channel.",
+            "description": (
+                "Publish a legacy-Markdown message: sent to Telegram when configured, otherwise "
+                "written to the console log. The final report is also saved to reports/."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -132,6 +135,7 @@ class RunState:
     data_result: Optional[Dict[str, Any]] = None
     backtest_report: Optional[Dict[str, Any]] = None
     final_report_sent: bool = False
+    markdown_path: Optional[str] = None
     messages_sent: int = 0
     tool_log: List[str] = field(default_factory=list)
 
@@ -176,13 +180,28 @@ class ResearchAgent:
         return report
 
     def _tool_send_telegram_update(self, message: str) -> Dict[str, Any]:
-        delivered = bool(self.send(message))
+        is_final = (
+            self.state.alert_sent
+            and self.state.backtest_report is not None
+            and len(message) >= FINAL_REPORT_MIN_CHARS
+        )
+        if is_final:
+            delivered = self._publish_final(message)
+        else:
+            delivered = bool(self.send(message))
         self.state.messages_sent += 1
-        if not self.state.alert_sent:
-            self.state.alert_sent = True
-        elif self.state.backtest_report is not None and len(message) >= FINAL_REPORT_MIN_CHARS:
-            self.state.final_report_sent = True
-        return {"delivered": delivered, "chars": len(message)}
+        self.state.alert_sent = True
+        channel = "telegram" if self.settings.telegram_enabled else "console"
+        # Console output always succeeds; only a failed Telegram send is a failure.
+        return {"delivered": delivered or channel == "console", "channel": channel, "chars": len(message)}
+
+    def _publish_final(self, text: str) -> bool:
+        """Save the final report to reports/, print it, and send it to Telegram if enabled."""
+        path = save_report_markdown(text, self.settings.reports_dir)
+        self.state.markdown_path = str(path) if path else None
+        self.state.final_report_sent = True
+        print("\n" + text + "\n", flush=True)
+        return bool(self.send(text))
 
     def dispatch(self, name: str, raw_args: str) -> Dict[str, Any]:
         """Execute a tool call by name with JSON-encoded arguments; never raises."""
@@ -337,12 +356,11 @@ class ResearchAgent:
 
         if not state.final_report_sent:
             if len(last_text) >= FINAL_REPORT_MIN_CHARS and not llm_error:
-                logger.info("Model did not send the report itself; forwarding its final answer.")
-                self.send(last_text)
+                logger.info("Model did not send the report itself; publishing its final answer.")
+                self._publish_final(last_text)
             else:
-                logger.info("Sending rule-based fallback report.")
-                self.send(build_report(state.backtest_report, state.data_result, llm_error))
-            state.final_report_sent = True
+                logger.info("Publishing rule-based fallback report.")
+                self._publish_final(build_report(state.backtest_report, state.data_result, llm_error))
 
         return self._summary("ok", llm_error)
 
@@ -353,8 +371,10 @@ class ResearchAgent:
             "status": status,
             "llm_error": llm_error,
             "tools_called": self.state.tool_log,
-            "telegram_messages": self.state.messages_sent,
+            "messages_sent": self.state.messages_sent,
             "data_status": (self.state.data_result or {}).get("status"),
             "report_path": report.get("report_path"),
+            "markdown_path": self.state.markdown_path,
+            "telegram": self.settings.telegram_enabled,
             "final_report_sent": self.state.final_report_sent,
         }

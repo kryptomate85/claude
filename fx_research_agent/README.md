@@ -1,16 +1,16 @@
 # EUR/USD Intraday Research Agent
 
-Quant research pipeline. It fetches OANDA M5 EUR/USD candles and keeps only the liquid 07:00–20:30 UTC bars. It backtests three intraday strategies with **zero overnight exposure** and sends progress pings and a rule-based research report to Telegram. **No LLM is required.** An OpenAI tool-calling analyst is available as an opt-in (`--llm`).
+Quant research pipeline. It fetches OANDA M5 EUR/USD candles and keeps only the liquid 07:00–20:30 UTC bars. It backtests three intraday strategies with **zero overnight exposure** and writes a rule-based research report. The report is printed to the console and saved to `reports/research_report_<UTC>.md`. **Only OANDA credentials are required.** Telegram delivery and an OpenAI tool-calling analyst (`--llm`) are both optional.
 
 ## Layout
 
 | File | Role |
 |---|---|
 | `config.py` | Loads and validates `.env` secrets and tuning settings |
-| `tools/notifier.py` | Telegram `sendMessage`: timeouts, retries, 429 handling, chunking, plain-text fallback if Markdown is rejected |
+| `tools/notifier.py` | *Optional* Telegram `sendMessage` (timeouts, retries, 429 handling, chunking, plain-text fallback); logs to the console when Telegram isn't configured |
 | `tools/data_fetcher.py` | OANDA `/v3/instruments/EUR_USD/candles` (M5, mid, complete only), paginated; filters to 07:00–20:30 UTC and writes `data/EUR_USD_M5.parquet`; uses the cache if the API is down |
 | `tools/strategies.py` | `london_momentum`, `ny_mean_reversion`, `london_orb`; the shared base `next()` enforces the 20:25 UTC flat rule |
-| `tools/backtest_runner.py` | Runs the suite on full, in-sample and out-of-sample data, sends Telegram pings, audits for overnight trades, writes the JSON report to `reports/` |
+| `tools/backtest_runner.py` | Runs the suite on full, in-sample and out-of-sample data, posts progress messages, audits for overnight trades, writes the JSON report to `reports/` |
 | `tools/report.py` | Rule-based analyst (the default): scorecard, edge vs. breakeven win rate, cost drag, out-of-sample stability, drawdown, verdict |
 | `agent.py` | *Optional* OpenAI tool-calling analyst (`--llm`); falls back to `tools/report.py` if the model is unavailable |
 | `main.py` | CLI entry point with console and rotating-file logging (`logs/agent.log`) |
@@ -21,7 +21,7 @@ Quant research pipeline. It fetches OANDA M5 EUR/USD candles and keeps only the 
 cd fx_research_agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in the four required secrets
+cp .env.example .env   # fill in OANDA_API_KEY and OANDA_ACCOUNT_ID
 python main.py                  # fetch -> backtest -> rule-based report
 python main.py --lookback 60    # custom lookback window
 

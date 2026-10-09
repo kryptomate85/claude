@@ -31,13 +31,13 @@ OANDA_HOSTS: Dict[str, str] = {
     "live": "https://api-fxtrade.oanda.com",
 }
 
-# Secrets the default (rule-based) pipeline needs.
+# Secrets the default pipeline needs.
 SECRET_KEYS: Tuple[str, ...] = (
     "OANDA_API_KEY",
     "OANDA_ACCOUNT_ID",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
 )
+# Optional: set both to receive progress pings and reports on Telegram.
+TELEGRAM_SECRET_KEYS: Tuple[str, ...] = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
 # Extra secret needed only for the optional LLM analyst (``main.py --llm``).
 LLM_SECRET_KEYS: Tuple[str, ...] = ("OPENAI_API_KEY",)
 
@@ -107,7 +107,7 @@ def _hhmm_to_minutes(value: str) -> int:
 class Settings:
     """Immutable, validated runtime settings."""
 
-    # Secrets (OpenAI is optional: only the --llm analyst uses it)
+    # Secrets (OpenAI and Telegram are optional)
     openai_api_key: str
     oanda_api_key: str
     oanda_account_id: str
@@ -153,6 +153,11 @@ class Settings:
         return self.data_dir / f"{self.instrument}_{self.granularity}.parquet"
 
     @property
+    def telegram_enabled(self) -> bool:
+        """True when Telegram delivery is configured (otherwise console only)."""
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
     def margin(self) -> float:
         """backtesting.py ``margin`` parameter derived from leverage."""
         return 1.0 / self.leverage
@@ -189,6 +194,14 @@ def load_settings(required: Tuple[str, ...] = SECRET_KEYS) -> Settings:
             "Missing required environment variables: "
             + ", ".join(missing)
             + ". Copy .env.example to .env and fill them in."
+        )
+
+    telegram_set = [key for key in TELEGRAM_SECRET_KEYS if _env_str(key)]
+    if len(telegram_set) == 1:
+        missing_tg = next(k for k in TELEGRAM_SECRET_KEYS if k not in telegram_set)
+        raise ConfigError(
+            f"{telegram_set[0]} is set but {missing_tg} is not. Set both to enable "
+            "Telegram, or neither to report to the console only."
         )
 
     environment = _env_str("OANDA_ENVIRONMENT", "practice").lower()

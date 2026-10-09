@@ -45,6 +45,7 @@ def test_agent_full_loop(settings, candles, monkeypatch) -> None:
     assert summary["status"] == "ok" and summary["final_report_sent"]
     assert summary["tools_called"] == ["send_telegram_update", "fetch_data", "run_backtest_suite", "send_telegram_update"]
     assert sent[0] == "started" and sent[-1] == final
+    assert open(summary["markdown_path"], encoding="utf-8").read().strip() == final.strip()
 
 
 def test_agent_llm_failure_uses_fallback(settings, candles, monkeypatch) -> None:

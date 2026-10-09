@@ -1,4 +1,8 @@
-"""Telegram Bot API notifier.
+"""Optional Telegram Bot API notifier.
+
+Telegram is optional. When ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_CHAT_ID`` are
+not configured, messages are written to the console log instead (first line
+only; full reports are printed and saved by the caller).
 
 Sends Markdown-formatted messages via ``sendMessage`` with timeouts, retries on
 transient failures / rate limits, automatic chunking for Telegram's 4096-char
@@ -63,7 +67,8 @@ class TelegramNotifier:
             True if every chunk was delivered, False otherwise.
         """
         if not self.enabled:
-            logger.warning("Telegram not configured; message dropped: %.120s", text)
+            first_line = text.strip().splitlines()[0] if text.strip() else ""
+            logger.info("[console] %s", first_line.replace("*", "").replace("`", ""))
             return False
         if not text or not text.strip():
             logger.warning("Refusing to send empty Telegram message.")
