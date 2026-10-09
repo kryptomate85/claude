@@ -2,9 +2,9 @@
 
 Examples::
 
-    python main.py                 # full agentic run (OpenAI + OANDA + Telegram)
-    python main.py --no-llm        # deterministic pipeline with rule-based report
+    python main.py                 # fetch -> backtest -> rule-based report (no LLM)
     python main.py --lookback 30   # override the lookback window
+    python main.py --llm           # optional: OpenAI tool-calling analyst writes the report
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from typing import List, Optional
 
-from config import PROJECT_ROOT, SECRET_KEYS, ConfigError, load_settings, set_settings
+from config import LLM_SECRET_KEYS, PROJECT_ROOT, SECRET_KEYS, ConfigError, load_settings, set_settings
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -48,20 +48,24 @@ def setup_logging(verbose: bool = False) -> None:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command-line options."""
     parser = argparse.ArgumentParser(description="Autonomous EUR/USD intraday research agent")
-    parser.add_argument("--no-llm", action="store_true", help="Skip the LLM and use the rule-based analyst.")
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Use the optional OpenAI tool-calling analyst (needs OPENAI_API_KEY and the openai package).",
+    )
     parser.add_argument("--lookback", type=int, default=None, help="Override LOOKBACK_DAYS.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging.")
     return parser.parse_args(argv)
 
 
-def run_deterministic() -> dict:
-    """Run fetch → backtest → rule-based report without any LLM."""
-    from agent import build_fallback_report
+def run_pipeline() -> dict:
+    """Run fetch → backtest → rule-based report. This is the default; no LLM is used."""
     from tools.backtest_runner import run_backtest_suite
     from tools.data_fetcher import fetch_data
     from tools.notifier import send_telegram_message
+    from tools.report import build_report
 
-    send_telegram_message("🚀 *EUR/USD research pipeline started* (deterministic mode)")
+    send_telegram_message("🚀 *EUR/USD research pipeline started*")
     data_result = fetch_data()
     if data_result.get("status") == "error":
         send_telegram_message(f"❌ *EUR/USD research aborted*: `{data_result.get('error')}`")
@@ -70,7 +74,7 @@ def run_deterministic() -> dict:
     if report.get("status") != "ok":
         send_telegram_message(f"❌ *Backtest suite failed*: `{report.get('error')}`")
         return {"status": "backtest_error", "error": report.get("error")}
-    send_telegram_message(build_fallback_report(report, data_result))
+    send_telegram_message(build_report(report, data_result))
     return {"status": "ok", "report_path": report.get("report_path")}
 
 
@@ -80,7 +84,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     setup_logging(args.verbose)
     log = logging.getLogger("main")
 
-    required = tuple(k for k in SECRET_KEYS if not (args.no_llm and k == "OPENAI_API_KEY"))
+    required = SECRET_KEYS + (LLM_SECRET_KEYS if args.llm else ())
     try:
         settings = load_settings(required)
         if args.lookback:
@@ -94,18 +98,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings.instrument,
         settings.granularity,
         settings.lookback_days,
-        "none" if args.no_llm else settings.openai_model,
+        settings.openai_model if args.llm else "none (rule-based report)",
         settings.oanda_environment,
     )
     log.debug("Secrets: %s", settings.masked())
 
     try:
-        if args.no_llm:
-            summary = run_deterministic()
-        else:
-            from agent import ResearchAgent
-
+        if args.llm:
+            try:
+                from agent import ResearchAgent
+            except ImportError as exc:
+                log.error("--llm needs the openai package (pip install openai): %s", exc)
+                return 2
             summary = ResearchAgent(settings).run()
+        else:
+            summary = run_pipeline()
     except KeyboardInterrupt:
         log.warning("Interrupted by user.")
         return 130

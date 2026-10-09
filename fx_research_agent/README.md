@@ -1,6 +1,6 @@
 # EUR/USD Intraday Research Agent
 
-Autonomous quant research agent. It fetches OANDA M5 EUR/USD candles and keeps only the liquid 07:00–20:30 UTC bars. It backtests three intraday strategies with **zero overnight exposure** and has an OpenAI tool-calling analyst send progress pings and a final report to Telegram.
+Quant research pipeline. It fetches OANDA M5 EUR/USD candles and keeps only the liquid 07:00–20:30 UTC bars. It backtests three intraday strategies with **zero overnight exposure** and sends progress pings and a rule-based research report to Telegram. **No LLM is required.** An OpenAI tool-calling analyst is available as an opt-in (`--llm`).
 
 ## Layout
 
@@ -11,7 +11,8 @@ Autonomous quant research agent. It fetches OANDA M5 EUR/USD candles and keeps o
 | `tools/data_fetcher.py` | OANDA `/v3/instruments/EUR_USD/candles` (M5, mid, complete only), paginated; filters to 07:00–20:30 UTC and writes `data/EUR_USD_M5.parquet`; uses the cache if the API is down |
 | `tools/strategies.py` | `london_momentum`, `ny_mean_reversion`, `london_orb`; the shared base `next()` enforces the 20:25 UTC flat rule |
 | `tools/backtest_runner.py` | Runs the suite on full, in-sample and out-of-sample data, sends Telegram pings, audits for overnight trades, writes the JSON report to `reports/` |
-| `agent.py` | OpenAI tool-calling loop (`fetch_data`, `run_backtest_suite`, `send_telegram_update`) plus a deterministic fallback analyst |
+| `tools/report.py` | Rule-based analyst (the default): scorecard, edge vs. breakeven win rate, cost drag, out-of-sample stability, drawdown, verdict |
+| `agent.py` | *Optional* OpenAI tool-calling analyst (`--llm`); falls back to `tools/report.py` if the model is unavailable |
 | `main.py` | CLI entry point with console and rotating-file logging (`logs/agent.log`) |
 
 ## Setup
@@ -20,9 +21,13 @@ Autonomous quant research agent. It fetches OANDA M5 EUR/USD candles and keeps o
 cd fx_research_agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in the five secrets
-python main.py         # agentic run
-python main.py --no-llm --lookback 60   # deterministic run, no OpenAI key needed
+cp .env.example .env   # fill in the four required secrets
+python main.py                  # fetch -> backtest -> rule-based report
+python main.py --lookback 60    # custom lookback window
+
+# Optional LLM analyst
+pip install openai              # and set OPENAI_API_KEY in .env
+python main.py --llm
 python -m pytest tests -q
 ```
 

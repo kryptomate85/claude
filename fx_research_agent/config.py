@@ -31,13 +31,15 @@ OANDA_HOSTS: Dict[str, str] = {
     "live": "https://api-fxtrade.oanda.com",
 }
 
+# Secrets the default (rule-based) pipeline needs.
 SECRET_KEYS: Tuple[str, ...] = (
-    "OPENAI_API_KEY",
     "OANDA_API_KEY",
     "OANDA_ACCOUNT_ID",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
 )
+# Extra secret needed only for the optional LLM analyst (``main.py --llm``).
+LLM_SECRET_KEYS: Tuple[str, ...] = ("OPENAI_API_KEY",)
 
 
 class ConfigError(RuntimeError):
@@ -105,7 +107,7 @@ def _hhmm_to_minutes(value: str) -> int:
 class Settings:
     """Immutable, validated runtime settings."""
 
-    # Secrets
+    # Secrets (OpenAI is optional: only the --llm analyst uses it)
     openai_api_key: str
     oanda_api_key: str
     oanda_account_id: str
@@ -174,9 +176,9 @@ def load_settings(required: Tuple[str, ...] = SECRET_KEYS) -> Settings:
     """Read, validate and return :class:`Settings`.
 
     Args:
-        required: Names of secret variables that must be present. Callers may
-            relax this (e.g. a cache-only, no-LLM run does not need
-            ``OPENAI_API_KEY``).
+        required: Names of secret variables that must be present. Defaults to
+            the rule-based pipeline's secrets; add ``LLM_SECRET_KEYS`` when the
+            LLM analyst is enabled.
 
     Raises:
         ConfigError: If a required variable is missing or a value is invalid.

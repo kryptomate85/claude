@@ -1,16 +1,19 @@
-"""Tests for the agent loop, notifier chunking and OANDA parsing (offline)."""
+"""Tests for notifier chunking, OANDA parsing, config and the default pipeline (offline)."""
 
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any, List
 
 import pandas as pd
+import pytest
 
-import agent as agent_mod
+import config
+import main
 from tools import data_fetcher
+from tools.backtest_runner import run_backtest_suite
 from tools.notifier import TelegramNotifier, split_message
+from tools.report import build_report
 
 
 def test_split_message_respects_limit() -> None:
@@ -83,51 +86,34 @@ def test_fetch_data_error_without_cache(settings, monkeypatch) -> None:
     assert data_fetcher.fetch_data(settings=settings)["status"] == "error"
 
 
-def _tool_call(i: int, name: str, args: dict) -> SimpleNamespace:
-    return SimpleNamespace(id=f"call_{i}", type="function", function=SimpleNamespace(name=name, arguments=json.dumps(args)))
+def test_config_does_not_require_openai(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for key in config.SECRET_KEYS:
+        monkeypatch.setenv(key, "x")
+    assert config.load_settings().openai_api_key == ""
+    with pytest.raises(config.ConfigError, match="OPENAI_API_KEY"):
+        config.load_settings(config.SECRET_KEYS + config.LLM_SECRET_KEYS)
 
 
-class ScriptedLLM:
-    """Stand-in chat client that replays a fixed tool-calling script."""
-
-    def __init__(self, steps: List[SimpleNamespace]) -> None:
-        self.steps = steps
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
-
-    def create(self, **kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(choices=[SimpleNamespace(message=self.steps.pop(0))])
+def test_build_report(settings, candles) -> None:
+    report = run_backtest_suite(settings=settings, notify=False, data=candles)
+    text = build_report(report, {"status": "stale_cache"})
+    for section in ("*Scorecard*", "*Analysis*", "*Verdict & Tactical Recommendations*", "`london_orb`", "cached candles"):
+        assert section in text
+    assert build_report(report, None) == build_report(report, None)  # deterministic
 
 
-def test_agent_full_loop(settings, candles, monkeypatch) -> None:
-    monkeypatch.setattr(agent_mod, "fetch_data", lambda **k: {"status": "ok", "rows": len(candles)})
-    real_suite = agent_mod.run_backtest_suite
-    monkeypatch.setattr(agent_mod, "run_backtest_suite", lambda **k: real_suite(data=candles, **k))
-    final = "*Report*\n" + "analysis line\n" * 60
-    script = [
-        SimpleNamespace(content=None, tool_calls=[_tool_call(1, "send_telegram_update", {"message": "started"})]),
-        SimpleNamespace(content=None, tool_calls=[_tool_call(2, "fetch_data", {})]),
-        SimpleNamespace(content=None, tool_calls=[_tool_call(3, "run_backtest_suite", {})]),
-        SimpleNamespace(content=None, tool_calls=[_tool_call(4, "send_telegram_update", {"message": final})]),
-    ]
-    sent: List[str] = []
-    bot = agent_mod.ResearchAgent(settings, client=ScriptedLLM(script), send=lambda m: sent.append(m) or True)
-    summary = bot.run()
-    assert summary["status"] == "ok" and summary["final_report_sent"]
-    assert summary["tools_called"] == ["send_telegram_update", "fetch_data", "run_backtest_suite", "send_telegram_update"]
-    assert sent[0] == "started" and sent[-1] == final
-
-
-def test_agent_llm_failure_uses_fallback(settings, candles, monkeypatch) -> None:
-    monkeypatch.setattr(agent_mod, "fetch_data", lambda **k: {"status": "ok"})
-    real_suite = agent_mod.run_backtest_suite
-    monkeypatch.setattr(agent_mod, "run_backtest_suite", lambda **k: real_suite(data=candles, **k))
-
-    class DeadLLM:
-        chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **k: (_ for _ in ()).throw(RuntimeError("down"))))
+def test_default_pipeline_needs_no_llm(settings, candles, monkeypatch) -> None:
+    import tools.backtest_runner as runner
+    import tools.data_fetcher as fetcher
+    import tools.notifier as notifier
 
     sent: List[str] = []
-    bot = agent_mod.ResearchAgent(settings, client=DeadLLM(), send=lambda m: sent.append(m) or True)
-    monkeypatch.setattr(bot, "_complete", lambda messages: (_ for _ in ()).throw(RuntimeError("LLM unavailable")))
-    summary = bot.run()
-    assert summary["status"] == "ok" and summary["llm_error"]
-    assert "rule-based" in sent[-1] and "Scorecard" in sent[-1]
+    monkeypatch.setattr(notifier, "send_telegram_message", lambda m, **k: sent.append(m) or True)
+    monkeypatch.setattr(runner, "send_telegram_message", lambda m, **k: sent.append(m) or True)
+    monkeypatch.setattr(fetcher, "fetch_data", lambda **k: {"status": "ok"})
+    real_suite = runner.run_backtest_suite
+    monkeypatch.setattr(runner, "run_backtest_suite", lambda **k: real_suite(settings=settings, data=candles, **k))
+    summary = main.run_pipeline()
+    assert summary["status"] == "ok"
+    assert sent[0].startswith("🚀") and "*Scorecard*" in sent[-1]
